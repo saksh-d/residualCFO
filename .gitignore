@@ -1,0 +1,11 @@
+
+# Ignore folders that contain generated results
+stage1_linear_outputs/
+stage2_nonlinear_outputs/
+
+# Ignore DS_store folder and macOS DS_Store files
+DS_store/
+.DS_Store
+
+# Ignore Python cache directories
+__pycache__/
