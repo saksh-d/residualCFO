@@ -1,0 +1,3 @@
+method,method_label,occupied_bandwidth_fraction,occupied_bandwidth,nominal_ofdm_bandwidth,out_of_band_power_ratio
+OFDM,Classical OFDM,0.99,0.701416015625,0.78125,0.0037214058935015615
+Learned,Learned Basis,0.99,0.793212890625,0.78125,0.01772674838913879
