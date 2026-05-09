@@ -43,13 +43,13 @@ def control_lines(config: ExperimentConfig) -> list[str]:
         f"- Stage 1 checkpoint: `{config.stage2_checkpoint_path}`",
         f"- Base seed: `{config.base_seed}`",
         f"- Frame: `M={config.M}, K={config.K}, N={config.N}, P={config.N_pilots}, G={config.N_guard}, R={config.redundancy_dimensions}`",
-        f"- Workflow: `nonlinear_only`",
+        f"- Workflow: `frozen_post_v`",
         f"- Train SNR: `{config.train_ebn0_db:.1f} dB`, train range `[{config.train_ebn0_db_min:.1f}, {config.train_ebn0_db_max:.1f}] dB`, eval SNR `{config.eval_ebn0_db:.1f} dB`",
-        f"- Nonlinear-only stage: epochs `{config.stage2_nonlinear_only_epochs}`, lr `{config.stage2_nonlinear_only_learning_rate}`, freeze `W` and `V`",
+        f"- Stage 2 training: epochs `{config.stage2_nonlinear_only_epochs}`, lr `{config.stage2_nonlinear_only_learning_rate}`, freeze `W` and `V`",
         f"- Decision loss: `{config.stage2_decision_loss}`",
-        f"- Detector: `{config.stage2_detector_arch.lower()}` with channels `{config.stage2_local_channels}`, kernel `{config.stage2_local_kernel_size}`, residual scale init `{config.stage2_residual_scale_init}`, cancellation scale init `{config.stage2_cancellation_scale_init}`",
-        f"- Features: confidence `{config.stage2_use_confidence_features}`, symbol correction head `{config.stage2_use_symbol_correction_head}`, residual logit head `{config.stage2_use_residual_logit_head}`",
-        f"- Losses: CFO aux `{config.stage2_cfo_loss_weight}`, hard-CFO weight `{config.stage2_hard_cfo_loss_weight}`, non-inferiority `{config.stage2_noninferiority_weight}`, eta `{config.stage2_loss_mse_weight}`",
+        f"- CFO estimator: `{config.stage2_detector_arch.lower()}` with channels `{config.stage2_local_channels}`, kernel `{config.stage2_local_kernel_size}`, hidden multiplier `{config.stage2_hidden_multiplier}`",
+        f"- Features: `[Re, Im, |z0|, cos(angle), sin(angle)]` per symbol, Stage 2 predicts `delta_hat` and applies a regularized symbol-domain solve",
+        f"- Losses: CFO aux `{config.stage2_cfo_loss_weight}`, symbol MSE `{config.stage2_loss_mse_weight}`, no hard-CFO or reopen-`V` training in the main path",
         f"- Frozen-front-end operator terms logged only: `{config.stage2_detector_only_logs_operator_terms}`",
         f"- Hard-CFO checkpoint target: abs CFO `{config.stage2_selection_abs_cfo_points}` with weights `{config.stage2_selection_abs_cfo_weights}`",
     ]
@@ -65,7 +65,7 @@ def run_stage2_nonlinear_only(config: ExperimentConfig | None = None) -> object:
     config = build_stage2_nonlinear_only_config() if config is None else config
     if config.stage2_checkpoint_path is None or not Path(config.stage2_checkpoint_path).exists():
         raise FileNotFoundError(f"Missing Stage 1 checkpoint: {config.stage2_checkpoint_path}")
-    print(f"Running Stage 2 nonlinear-only experiment -> {config.output_dir}")
+    print(f"Running Stage 2 post-V CFO-estimator/MMSE experiment -> {config.output_dir}")
     result = run_stage2_experiment(config=config)
     report_path = write_markdown_report(
         config=config,
@@ -73,10 +73,10 @@ def run_stage2_nonlinear_only(config: ExperimentConfig | None = None) -> object:
         output_dir=config.output_dir,
         plot_files=PLOT_FILES,
         extra_metadata={
-            "title": "Residual-CFO Stage 2 Nonlinear-Only Report",
+            "title": "Residual-CFO Stage 2 Post-V Adaptive Report",
             "overview_lines": [
-                "Script-only Stage 2 nonlinear-only package for the structured `16QAM` experiment.",
-                "This workflow freezes the Stage 1 linear transceiver and trains only the nonlinear detector.",
+                "Script-only Stage 2 post-V adaptive package for the structured `16QAM` experiment.",
+                "This workflow freezes the Stage 1 linear transceiver, estimates residual CFO from `z0`, and applies a basis-aware regularized symbol-domain solve for both OFDM and Learned front ends.",
             ],
             "control_lines": control_lines(config),
         },

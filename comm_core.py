@@ -15,7 +15,7 @@ import torch
 
 SUPPORTED_MODULATIONS = ("QPSK", "16QAM")
 SUPPORTED_TONE_PATTERNS = ("CONTIGUOUS", "SPREAD")
-SUPPORTED_STAGE2_WORKFLOWS = ("NONLINEAR_ONLY", "JOINT")
+SUPPORTED_STAGE2_WORKFLOWS = ("NONLINEAR_ONLY",)
 SUPPORTED_STAGE2_DETECTORS = ("DENSE", "LOCAL")
 SUPPORTED_STAGE2_DECISION_LOSSES = ("SYMBOL_CE", "BIT_BCE")
 
@@ -103,7 +103,7 @@ class ExperimentConfig:
     pilot_estimation_enabled: bool = True
     pilot_estimator_cfo_grid: np.ndarray = field(default_factory=lambda: np.linspace(-0.20, 0.20, 81))
     stage2_enabled: bool = False
-    stage2_workflow: str = "JOINT"
+    stage2_workflow: str = "NONLINEAR_ONLY"
     stage2_detector_arch: str = "LOCAL"
     stage2_residual_scale_init: float = 0.1
     stage2_hidden_multiplier: int = 4
@@ -134,13 +134,6 @@ class ExperimentConfig:
     stage2_checkpoint_ofdm_ber_at_0: float | None = None
     stage2_nonlinear_only_epochs: int = 200
     stage2_nonlinear_only_learning_rate: float = 1.0e-3
-    stage2_warmstart_epochs: int = 200
-    stage2_warmstart_learning_rate: float = 1.0e-3
-    stage2_reopen_v_after_win: bool = True
-    stage2_reopen_v_requires_gain: bool = True
-    stage2_reopen_v_gain_tol: float = 0.0
-    stage2_reopen_v_epochs: int = 300
-    stage2_reopen_v_learning_rate: float = 5.0e-4
     stage2_selection_abs_cfo_points: tuple[float, ...] = (0.05, 0.10)
     stage2_selection_abs_cfo_weights: tuple[float, ...] = (0.35, 0.65)
     # basis_plot_indices: tuple[int, ...] | None = None
@@ -257,14 +250,6 @@ class ExperimentConfig:
             raise ValueError("stage2_nonlinear_only_epochs must be positive.")
         if self.stage2_nonlinear_only_learning_rate <= 0.0:
             raise ValueError("stage2_nonlinear_only_learning_rate must be positive.")
-        if self.stage2_warmstart_epochs <= 0:
-            raise ValueError("stage2_warmstart_epochs must be positive.")
-        if self.stage2_warmstart_learning_rate <= 0.0:
-            raise ValueError("stage2_warmstart_learning_rate must be positive.")
-        if self.stage2_reopen_v_epochs <= 0:
-            raise ValueError("stage2_reopen_v_epochs must be positive.")
-        if self.stage2_reopen_v_learning_rate <= 0.0:
-            raise ValueError("stage2_reopen_v_learning_rate must be positive.")
         self.stage2_selection_abs_cfo_points = tuple(float(value) for value in self.stage2_selection_abs_cfo_points)
         self.stage2_selection_abs_cfo_weights = tuple(float(value) for value in self.stage2_selection_abs_cfo_weights)
         if not self.stage2_selection_abs_cfo_points:
@@ -827,16 +812,32 @@ def run_stage2_experiment(config: ExperimentConfig) -> ExperimentResult:
     learned_tx = checkpoint["learned_tx"].to(config.device)
     learned_rx = checkpoint["learned_rx"].to(config.device)
 
+    ofdm_tx, ofdm_rx = make_ofdm_baseline_transceiver(config)
+    ofdm_stage2 = train_stage2_nonlinear_receiver(
+        config=config,
+        tx_basis=ofdm_tx,
+        rx_basis=ofdm_rx,
+        scheme_name="OFDMNonlinear",
+        seed_offset=0,
+    )
     learned_stage2 = train_stage2_nonlinear_receiver(
         config=config,
         tx_basis=learned_tx,
         rx_basis=learned_rx,
         scheme_name="LearnedNonlinear",
-        seed_offset=0,
+        seed_offset=1,
     )
 
-    history_df = learned_stage2.history_df.sort_values(["scheme", "global_epoch"], kind="stable")
-    stage_summary_df = learned_stage2.stage_summary_df.sort_values("scheme", kind="stable")
+    history_df = (
+        pd.concat([ofdm_stage2.history_df, learned_stage2.history_df], ignore_index=True)
+        .sort_values(["scheme", "global_epoch"], kind="stable")
+        .reset_index(drop=True)
+    )
+    stage_summary_df = (
+        pd.concat([ofdm_stage2.stage_summary_df, learned_stage2.stage_summary_df], ignore_index=True)
+        .sort_values(["scheme", "stage"], kind="stable")
+        .reset_index(drop=True)
+    )
     training_result = TrainingResult(
         learned_tx=learned_stage2.learned_tx.detach().clone(),
         learned_rx=learned_stage2.learned_rx.detach().clone(),
@@ -844,15 +845,15 @@ def run_stage2_experiment(config: ExperimentConfig) -> ExperimentResult:
         stage_summary_df=stage_summary_df.copy(),
         stage_failed=False,
         failed_stage=None,
-        stop_reason=(
-            "Completed Stage 2 nonlinear-only receiver training."
-            if config.stage2_workflow == "NONLINEAR_ONLY"
-            else "Completed Stage 2 joint nonlinear receiver training."
-        ),
+        stop_reason="Completed frozen post-V Stage 2 CFO-estimator/MMSE training for OFDM and Learned front ends.",
     )
-    ofdm_tx, ofdm_rx = make_ofdm_baseline_transceiver(config)
     schemes = {
         "OFDM": EvaluationScheme(tx_basis=ofdm_tx, rx_basis=ofdm_rx, nonlinear_receiver=None),
+        "OFDMNonlinear": EvaluationScheme(
+            tx_basis=ofdm_stage2.learned_tx,
+            rx_basis=ofdm_stage2.learned_rx,
+            nonlinear_receiver=ofdm_stage2.receiver.eval(),
+        ),
         "Learned": EvaluationScheme(tx_basis=learned_tx, rx_basis=learned_rx, nonlinear_receiver=None),
         "LearnedNonlinear": EvaluationScheme(
             tx_basis=learned_stage2.learned_tx,
@@ -864,7 +865,7 @@ def run_stage2_experiment(config: ExperimentConfig) -> ExperimentResult:
         config,
         training_result,
         schemes=schemes,
-        method_order=("OFDM", "Learned", "LearnedNonlinear"),
+        method_order=("OFDM", "OFDMNonlinear", "Learned", "LearnedNonlinear"),
     )
     result.artifact_paths["stage1_checkpoint_snapshot"] = checkpoint_snapshot_path
     return result

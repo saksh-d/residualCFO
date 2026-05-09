@@ -30,17 +30,34 @@ from receiver import (
 from transmitter import frame_resource_layout, make_ofdm_baseline_transceiver, sample_training_symbols, transmit_symbols
 
 
-METHOD_ORDER = ("OFDM", "Learned", "LearnedNonlinear", "LearnedSpectral")
+METHOD_ORDER = (
+    "OFDM",
+    "OFDMNonlinear",
+    "Learned",
+    "LearnedOraclePreV",
+    "LearnedOracleMMSE",
+    "LearnedNonlinear",
+    "LearnedNonlinearOracleEps",
+    "LearnedSpectral",
+)
 METHOD_DISPLAY_NAMES = {
     "OFDM": "Classical OFDM",
+    "OFDMNonlinear": "OFDM + Stage 2",
     "Learned": "Learned Basis",
-    "LearnedNonlinear": "Learned + Nonlinear RX",
+    "LearnedOraclePreV": "Learned + Oracle Pre-V CFO",
+    "LearnedOracleMMSE": "Learned + Oracle MMSE",
+    "LearnedNonlinear": "Learned + Stage 2",
+    "LearnedNonlinearOracleEps": "Learned + Stage 2 (True delta)",
     "LearnedSpectral": "Learned + Spectral Mask",
 }
 METHOD_COLORS = {
     "OFDM": "#3A5F8A",
+    "OFDMNonlinear": "#79A7D3",
     "Learned": "#C05A2B",
+    "LearnedOraclePreV": "#7E6AA2",
+    "LearnedOracleMMSE": "#2D8A5F",
     "LearnedNonlinear": "#E39A5F",
+    "LearnedNonlinearOracleEps": "#C74B50",
     "LearnedSpectral": "#2D8A5F",
 }
 
@@ -80,13 +97,53 @@ def linear_method_order(schemes: dict[str, EvaluationScheme]) -> list[str]:
 def transmitter_plot_method_order(schemes: dict[str, EvaluationScheme]) -> list[str]:
     available = set(schemes.keys())
     order: list[str] = []
-    for pair in (("OFDM",), ("Learned", "LearnedNonlinear"), ("LearnedSpectral",)):
+    for pair in (("OFDM", "OFDMNonlinear"), ("Learned", "LearnedNonlinear"), ("LearnedSpectral",)):
         for method in pair:
             if method in available:
                 order.append(method)
                 break
     extras = [method for method in ordered_methods(available) if method not in order]
     return order + extras
+
+
+def average_metrics_by_abs_cfo(ber_df: pd.DataFrame) -> pd.DataFrame:
+    if ber_df.empty:
+        return ber_df.copy()
+    frame = ber_df.copy()
+    frame["eps"] = np.abs(frame["eps"].to_numpy(dtype=float))
+    numeric_cols = [
+        col
+        for col in (
+            "ber",
+            "ser",
+            "evm",
+            "pilot_symbol_mse",
+            "cfo_est_mae",
+            "cfo_est_bias",
+            "mean_estimated_eps",
+            "stage2_eps_hat_mae",
+            "stage2_eps_hat_bias",
+            "stage2_eps_hat_mean",
+        )
+        if col in frame.columns
+    ]
+    base_cols = {
+        "modulation": "first",
+        "N": "first",
+        "M": "first",
+        "K": "first",
+        "R": "first",
+        "N_data": "first",
+        "N_pilots": "first",
+        "N_guard": "first",
+        "payload_region_fraction": "first",
+        "payload_fraction": "first",
+        "train_ebn0_db": "first",
+        "eval_ebn0_db": "first",
+    }
+    grouped = frame.groupby(["method", "eps"], as_index=False).agg({**base_cols, **{col: "mean" for col in numeric_cols}})
+    grouped["method_label"] = grouped["method"].map(method_display_name)
+    return grouped.sort_values(["method", "eps"], kind="stable").reset_index(drop=True)
 
 
 def redundancy_ratio_tick_label(value: float) -> str:
@@ -257,7 +314,7 @@ def build_summary_df(
     rows: list[dict[str, float | int | str | bool]] = []
     thresholds = robustness_thresholds(config.modulation)
     for method in ordered_methods(ber_df["method"].unique().tolist()):
-        ber_group = ber_df[ber_df["method"] == method].sort_values("eps")
+        ber_group = average_metrics_by_abs_cfo(ber_df[ber_df["method"] == method]).sort_values("eps")
         op_group = operator_df[operator_df["method"] == method]
 
         def _nearest_metric(eps: float, column: str) -> float:
@@ -339,6 +396,8 @@ def build_summary_df(
                 "evm_at_0p10": _nearest_metric(0.10, "evm"),
                 "pilot_symbol_mse_at_0p10": _nearest_metric(0.10, "pilot_symbol_mse"),
                 "cfo_est_mae_at_0p10": _nearest_metric(0.10, "cfo_est_mae"),
+                "stage2_eps_hat_mae_at_0p10": _nearest_metric(0.10, "stage2_eps_hat_mae"),
+                "stage2_eps_hat_bias_at_0p10": _nearest_metric(0.10, "stage2_eps_hat_bias"),
             }
         )
         for threshold in thresholds:
@@ -442,7 +501,13 @@ def build_constellation_df(
             scheme = schemes[method]
             tx_signal = transmit_symbols(symbols, scheme.tx_basis)
             rx_signal, _ = propagate(tx_signal, eps_tensor, config, ebn0_db=config.eval_ebn0_db, noise=noise)
-            outputs = detect_scheme_symbols(config, scheme, rx_signal, eps_tensor=eps_tensor)
+            outputs = detect_scheme_symbols(
+                config,
+                scheme,
+                rx_signal,
+                eps_tensor=eps_tensor,
+                ebn0_db=config.eval_ebn0_db,
+            )
             shat = outputs["symbol_estimates"].reshape(-1).detach().cpu().numpy()
             rows.append(
                 pd.DataFrame(
@@ -883,8 +948,12 @@ def write_markdown_report(
             lines.append(f"![{path.name}]({relpath(path)})")
             lines.append("")
 
+    report_body = "\n".join(lines).rstrip() + "\n"
     report_path = output_dir / "report.md"
-    report_path.write_text("\n".join(lines).rstrip() + "\n")
+    report_path.write_text(report_body)
+    if config.stage2_enabled:
+        uppercase_report_path = output_dir / "report.MD"
+        uppercase_report_path.write_text(report_body)
     return report_path
 
 
@@ -1475,9 +1544,10 @@ def plot_nearest_neighbor_leakage(config: ExperimentConfig, operator_df: pd.Data
 def plot_ber_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | None:
     if ber_df.empty:
         return None
+    plot_df = average_metrics_by_abs_cfo(ber_df) if config.stage2_enabled else ber_df
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(ber_df["method"].unique().tolist()):
-        group = ber_df[ber_df["method"] == method].sort_values("eps")
+    for method in ordered_methods(plot_df["method"].unique().tolist()):
+        group = plot_df[plot_df["method"] == method].sort_values("eps")
         plt.semilogy(
             group["eps"],
             group["ber"],
@@ -1489,22 +1559,44 @@ def plot_ber_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | Non
     plt.title(
         f"BER vs residual CFO | {config.modulation}, N={config.N}, M={config.M}, eval {config.eval_ebn0_db:.0f} dB"
     )
-    plt.xlabel("Normalized residual CFO")
+    plt.xlabel("Absolute residual CFO" if config.stage2_enabled else "Normalized residual CFO")
     plt.ylabel("BER")
     plt.grid(True, which="both", alpha=0.3)
     plt.legend()
     path = config.output_dir / "ber_vs_cfo.png"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
+    if config.stage2_enabled:
+        signed_fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
+        for method in ordered_methods(ber_df["method"].unique().tolist()):
+            group = ber_df[ber_df["method"] == method].sort_values("eps")
+            plt.semilogy(
+                group["eps"],
+                group["ber"],
+                marker="o",
+                linewidth=2.0,
+                color=method_color(method),
+                label=method_display_name(method),
+            )
+        plt.title(
+            f"BER vs signed residual CFO | {config.modulation}, N={config.N}, M={config.M}, eval {config.eval_ebn0_db:.0f} dB"
+        )
+        plt.xlabel("Normalized residual CFO")
+        plt.ylabel("BER")
+        plt.grid(True, which="both", alpha=0.3)
+        plt.legend()
+        signed_fig.savefig(config.output_dir / "ber_vs_cfo_signed.png", bbox_inches="tight")
+        plt.close(signed_fig)
     return path
 
 
 def plot_evm_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | None:
     if ber_df.empty:
         return None
+    plot_df = average_metrics_by_abs_cfo(ber_df) if config.stage2_enabled else ber_df
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(ber_df["method"].unique().tolist()):
-        group = ber_df[ber_df["method"] == method].sort_values("eps")
+    for method in ordered_methods(plot_df["method"].unique().tolist()):
+        group = plot_df[plot_df["method"] == method].sort_values("eps")
         plt.plot(
             group["eps"],
             group["evm"],
@@ -1516,7 +1608,7 @@ def plot_evm_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | Non
     plt.title(
         f"EVM vs residual CFO | {config.modulation}, N={config.N}, M={config.M}, eval {config.eval_ebn0_db:.0f} dB"
     )
-    plt.xlabel("Normalized residual CFO")
+    plt.xlabel("Absolute residual CFO" if config.stage2_enabled else "Normalized residual CFO")
     plt.ylabel("EVM")
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -1831,19 +1923,17 @@ def plot_spectral_fairness(
 
 def build_mapping_markdown(config: ExperimentConfig) -> str:
     if config.stage2_enabled:
-        workflow_label = "nonlinear_only" if config.stage2_workflow == "NONLINEAR_ONLY" else "joint"
         return "\n".join(
             [
-                f"**Stage 2 Nonlinear Mapping ({workflow_label})**",
+                "**Stage 2 Post-V Adaptive Refinement**",
                 "",
-                rf"$z_0 = V y,\quad (\hat{{s}}, \ell) = R_\theta(z_0)$",
+                rf"$z_0 = V y,\quad \hat{{\delta}} = g_\theta(z_0),\quad \hat{{s}} = G(\hat{{\delta}}) z_0$",
                 "",
                 "- The Stage 1 linear receiver remains the interpretable front-end.",
-                "- The nonlinear receiver is a CFO-conditioned residual symbol-domain corrector: it refines `z_0`, optionally uses tentative-decision cancellation, and decodes through geometry-anchored `16QAM` logits.",
-                "- `nonlinear_only` freezes `W` and `V` and trains only `R_theta`.",
-                "- `joint` first trains `R_theta` with frozen `W,V`, then optionally reopens `V` while keeping `W` fixed.",
-                "- The direct residual-logit bypass is disabled by default so Stage 2 improves BER by improving corrected symbols.",
-                "- BER is decoded from geometry-derived bit logits thresholded at zero, while EVM continues to use corrected complex-symbol estimates.",
+                "- Stage 2 uses only observable soft-symbol features from `z_0` to estimate the residual CFO; it never receives the true CFO at test time.",
+                "- The correction matrix is built from the fixed front-end operator `A(hat(delta)) = V Phi_hat(delta) W` and applied through a regularized symbol-domain solve.",
+                "- `W` and `V` remain frozen in the main Stage 2 experiment so any BER gain is attributable to post-`V` adaptation rather than front-end retuning.",
+                "- BER is decoded from geometry-derived bit logits thresholded at zero, while EVM continues to use the corrected complex-symbol estimates.",
             ]
         )
     if config.payload_region_enabled:
@@ -1900,8 +1990,7 @@ def build_summary_markdown(
     papr_summary_df: pd.DataFrame,
 ) -> str:
     if config.stage2_enabled:
-        workflow_label = "nonlinear_only" if config.stage2_workflow == "NONLINEAR_ONLY" else "joint"
-        lines = [f"**Stage 2 Nonlinear Comparison Summary ({workflow_label})**"]
+        lines = ["**Stage 2 Four-Way Comparison Summary**"]
         lines.append(
             f"- Configuration: `{config.modulation}`, `N={config.N}`, `M={config.M}`, train `{config.train_ebn0_db:.0f} dB`, eval `{config.eval_ebn0_db:.0f} dB`."
         )
@@ -1916,84 +2005,36 @@ def build_summary_markdown(
             lines.append(
                 f"- Stage 2 identity diagnostic: symbol-MSE-to-`z0` `{identity_row['identity_symbol_mse_to_z0']:.4e}`, "
                 f"max-logit diff `{identity_row['identity_max_logit_abs_diff']:.4e}`, "
-                f"max-bit-logit diff `{identity_row.get('identity_max_bit_logit_abs_diff', float('nan')):.4e}`, "
                 f"bit mismatch vs Stage 1 `{identity_row['identity_bit_mismatch_rate_vs_stage1']:.4e}`."
             )
         for _, row in stage_summary_df.iterrows():
-            if np.isfinite(row["val_total"]):
-                lines.append(
-                    f"- {row['stage']}: best stage epoch `{int(row.get('best_stage_epoch', row['best_global_epoch']))}`"
-                    f" (global `{int(row['best_global_epoch'])}`), "
-                    f"val total `{row['val_total']:.4e}`, val BER `{row['val_ber']:.4e}`, hard-CFO weighted BER `{row['hard_cfo_weighted_ber']:.4e}` vs Stage 1 `{row.get('baseline_hard_cfo_weighted_ber', float('nan')):.4e}`, residual scale `{row['residual_scale']:.4f}`, "
-                    f"cancellation scale `{row.get('cancellation_scale', float('nan')):.4f}`, eps-hat MAE `{row.get('eps_hat_mae', float('nan')):.4e}`, "
-                    f"clean identity `{row['clean_identity_loss']:.4e}`, clean leakage `{row['clean_offdiag_leakage']:.4e}`."
-                )
-            else:
-                lines.append(f"- {row['stage']}: {row['stop_reason']}")
+            lines.append(
+                f"- {row['scheme']} {row['stage']}: best epoch `{int(row.get('best_stage_epoch', row['best_global_epoch']))}`, "
+                f"val BER `{row['val_ber']:.4e}`, hard-CFO BER `{row['hard_cfo_weighted_ber']:.4e}`, "
+                f"eps-hat MAE `{row.get('eps_hat_mae', float('nan')):.4e}`, blend `{row['residual_scale']:.4f}`."
+            )
 
+        ofdm_linear = summary_df[summary_df["method"] == "OFDM"].iloc[0]
+        ofdm_stage2 = summary_df[summary_df["method"] == "OFDMNonlinear"].iloc[0]
         learned_linear = summary_df[summary_df["method"] == "Learned"].iloc[0]
         learned_nonlinear = summary_df[summary_df["method"] == "LearnedNonlinear"].iloc[0]
-        ofdm_linear = summary_df[summary_df["method"] == "OFDM"].iloc[0]
-        checkpoint_clean_identity = config.stage2_checkpoint_clean_identity_loss
-        checkpoint_clean_leakage = config.stage2_checkpoint_clean_offdiag_leakage
-        checkpoint_linear_ber_at_0 = config.stage2_checkpoint_learned_ber_at_0
         lines.append(
-            f"- Frozen linear checkpoint baseline: clean identity `{checkpoint_clean_identity:.4e}`, "
-            f"clean leakage `{checkpoint_clean_leakage:.4e}`, BER(0) `{checkpoint_linear_ber_at_0:.3e}`."
-        )
-        linear_ber_at_0 = checkpoint_linear_ber_at_0 if checkpoint_linear_ber_at_0 is not None else learned_linear["ber_at_0"]
-        delta_0 = learned_nonlinear["ber_at_0"] - linear_ber_at_0
-        delta_005 = learned_nonlinear["ber_at_0p05"] - learned_linear["ber_at_0p05"]
-        delta_010 = learned_nonlinear["ber_at_0p10"] - learned_linear["ber_at_0p10"]
-        lines.append(
-            f"- Learned BER at CFO `0.00`: linear `{linear_ber_at_0:.3e}` vs nonlinear `{learned_nonlinear['ber_at_0']:.3e}` (delta `{delta_0:+.3e}`)."
+            f"- BER at `|delta|=0.10`: OFDM `{ofdm_linear['ber_at_0p10']:.3e}`, OFDM + Stage 2 `{ofdm_stage2['ber_at_0p10']:.3e}`, "
+            f"Learned `{learned_linear['ber_at_0p10']:.3e}`, Learned + Stage 2 `{learned_nonlinear['ber_at_0p10']:.3e}`."
         )
         lines.append(
-            f"- Learned BER at CFO `0.05`: linear `{learned_linear['ber_at_0p05']:.3e}` vs nonlinear `{learned_nonlinear['ber_at_0p05']:.3e}` (delta `{delta_005:+.3e}`)."
+            f"- BER at `|delta|=0.05`: OFDM `{ofdm_linear['ber_at_0p05']:.3e}`, OFDM + Stage 2 `{ofdm_stage2['ber_at_0p05']:.3e}`, "
+            f"Learned `{learned_linear['ber_at_0p05']:.3e}`, Learned + Stage 2 `{learned_nonlinear['ber_at_0p05']:.3e}`."
         )
         lines.append(
-            f"- Learned BER at CFO `0.10`: linear `{learned_linear['ber_at_0p10']:.3e}` vs nonlinear `{learned_nonlinear['ber_at_0p10']:.3e}` (delta `{delta_010:+.3e}`)."
-        )
-        if learned_nonlinear["ber_at_0p05"] < learned_linear["ber_at_0p05"] - 1e-12:
-            lines.append("- Stage 2 beat `stage1_linear` at CFO `0.05`.")
-        elif learned_nonlinear["ber_at_0p05"] > learned_linear["ber_at_0p05"] + 1e-12:
-            lines.append("- Stage 2 did not beat `stage1_linear` at CFO `0.05`.")
-        else:
-            lines.append("- Stage 2 effectively matched `stage1_linear` at CFO `0.05`.")
-        if learned_nonlinear["ber_at_0p10"] < learned_linear["ber_at_0p10"] - 1e-12:
-            lines.append("- Stage 2 beat `stage1_linear` at CFO `0.10`.")
-        elif learned_nonlinear["ber_at_0p10"] > learned_linear["ber_at_0p10"] + 1e-12:
-            lines.append("- Stage 2 did not beat `stage1_linear` at CFO `0.10`; the nonlinear branch underperformed there.")
-        else:
-            lines.append("- Stage 2 effectively matched `stage1_linear` at CFO `0.10`.")
-        if learned_nonlinear["ber_at_0"] <= learned_linear["ber_at_0"] + 1e-12:
-            lines.append("- Stage 2 avoided a BER regression at zero CFO.")
-        else:
-            lines.append("- Stage 2 regressed at zero CFO.")
-        lines.append(
-            f"- Against the classical baseline at CFO `0.10`: learned linear `{learned_linear['ber_at_0p10']:.3e}`, "
-            f"learned nonlinear `{learned_nonlinear['ber_at_0p10']:.3e}`, OFDM `{ofdm_linear['ber_at_0p10']:.3e}`."
+            f"- Robustness window BER <= `0.01`: OFDM `{ofdm_linear['robust_window_ber_le_0.01']:.3f}`, "
+            f"OFDM + Stage 2 `{ofdm_stage2['robust_window_ber_le_0.01']:.3f}`, Learned `{learned_linear['robust_window_ber_le_0.01']:.3f}`, "
+            f"Learned + Stage 2 `{learned_nonlinear['robust_window_ber_le_0.01']:.3f}`."
         )
         lines.append(
-            f"- Learned robustness window BER <= `0.01`: linear `|delta|<={learned_linear['robust_window_ber_le_0.01']:.3f}` "
-            f"vs nonlinear `|delta|<={learned_nonlinear['robust_window_ber_le_0.01']:.3f}`."
+            f"- Stage 2 CFO-estimate MAE at `|delta|=0.10`: OFDM + Stage 2 `{ofdm_stage2['stage2_eps_hat_mae_at_0p10']:.4e}`, "
+            f"Learned + Stage 2 `{learned_nonlinear['stage2_eps_hat_mae_at_0p10']:.4e}`."
         )
-        lines.append(
-            f"- Learned EVM at CFO `0.10`: linear `{learned_linear['evm_at_0p10']:.4f}` vs nonlinear `{learned_nonlinear['evm_at_0p10']:.4f}`."
-        )
-        if not spectral_summary_df.empty and not papr_summary_df.empty:
-            learned_spec = spectral_summary_df[spectral_summary_df["method"].isin(["Learned", "LearnedNonlinear"])]
-            if len(learned_spec) == 2:
-                lines.append(
-                    f"- Learned spectral check: OOB linear `{learned_spec.iloc[0]['out_of_band_power_ratio']:.4e}`, "
-                    f"nonlinear `{learned_spec.iloc[1]['out_of_band_power_ratio']:.4e}`."
-                )
-            learned_papr = papr_summary_df[papr_summary_df["method"].isin(["Learned", "LearnedNonlinear"])]
-            if len(learned_papr) == 2:
-                lines.append(
-                    f"- Learned PAPR check: linear `{learned_papr.iloc[0]['papr_p95_db']:.2f} dB`, "
-                    f"nonlinear `{learned_papr.iloc[1]['papr_p95_db']:.2f} dB`."
-                )
         return "\n".join(lines)
 
     learned = summary_df[summary_df["method"] == "Learned"].iloc[0]

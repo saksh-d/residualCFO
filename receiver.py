@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from channel import apply_residual_cfo, effective_operator, propagate
-from comm_core import ExperimentConfig, StageSpec, TrainingResult, normalize_columns, set_seed, stage_specs
+from comm_core import ExperimentConfig, StageSpec, TrainingResult, ebn0_to_noise_variance, normalize_columns, set_seed, stage_specs
 from transmitter import (
     _QAM16_DECISION_BITS,
     contiguous_band_bins_with_guard,
@@ -32,6 +32,10 @@ class EvaluationScheme:
     tx_basis: torch.Tensor
     rx_basis: torch.Tensor
     nonlinear_receiver: nn.Module | None = None
+    oracle_pre_v_cfo: bool = False
+    oracle_post_v_mmse: bool = False
+    oracle_mmse_alpha: float | None = None
+    oracle_eps_conditioning: bool = False
 
 
 @dataclass
@@ -148,6 +152,21 @@ def real_features_to_complex(features: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Expected an even feature dimension, got {features.shape[-1]}.")
     half = features.shape[-1] // 2
     return torch.complex(features[..., :half], features[..., half:]).to(torch.complex64)
+
+
+def oracle_symbol_mmse_equalize(
+    z0: torch.Tensor,
+    tx_basis: torch.Tensor,
+    rx_basis: torch.Tensor,
+    eps_values: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    operator = effective_operator(tx_basis, rx_basis, eps_values)
+    ah = torch.conj(torch.transpose(operator, -2, -1))
+    eye = torch.eye(operator.shape[-1], device=operator.device, dtype=operator.dtype).unsqueeze(0)
+    lhs = ah @ operator + float(alpha) * eye
+    rhs = ah @ z0.unsqueeze(-1)
+    return torch.linalg.solve(lhs, rhs).squeeze(-1)
 
 
 def decode_symbols(y: torch.Tensor, rx_basis: torch.Tensor) -> torch.Tensor:
@@ -529,59 +548,18 @@ class RedundantLinearWaveform(nn.Module):
         return self.rx_raw()
 
 
-class DenseSymbolResidualReceiver(nn.Module):
-    def __init__(
-        self,
-        num_symbols: int,
-        hidden_multiplier: int = 4,
-        residual_scale_init: float = 0.1,
-        use_residual_logit_head: bool = False,
-    ) -> None:
-        super().__init__()
-        if num_symbols <= 0:
-            raise ValueError("num_symbols must be positive.")
-        if hidden_multiplier < 1:
-            raise ValueError("hidden_multiplier must be at least 1.")
-        if residual_scale_init <= 0.0:
-            raise ValueError("residual_scale_init must be positive.")
-
-        self.num_symbols = int(num_symbols)
-        self.feature_dim = 2 * self.num_symbols
-        self.hidden_dim = self.feature_dim * int(hidden_multiplier)
-        self.use_residual_logit_head = bool(use_residual_logit_head)
-        self.fc1 = nn.Linear(self.feature_dim, self.hidden_dim)
-        self.fc2 = nn.Linear(self.hidden_dim, self.feature_dim)
-        self.classifier = nn.Linear(self.hidden_dim, 16 * self.num_symbols) if self.use_residual_logit_head else None
-        self.log_residual_scale = nn.Parameter(torch.log(torch.tensor(float(residual_scale_init), dtype=torch.float32)))
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-        if self.classifier is not None:
-            nn.init.zeros_(self.classifier.weight)
-            nn.init.zeros_(self.classifier.bias)
-
-    def residual_scale(self) -> torch.Tensor:
-        return torch.exp(self.log_residual_scale)
-
-    def constellation_logits(self, corrected_symbols: torch.Tensor) -> torch.Tensor:
-        constellation = qam16_constellation_points(corrected_symbols.device, dtype=corrected_symbols.dtype)
-        distances = torch.abs(corrected_symbols.unsqueeze(-1) - constellation.view(1, 1, -1)) ** 2
-        return (-distances.real).to(torch.float32)
-
-    def forward(self, z0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        u0 = complex_to_real_features(z0)
-        hidden = F.gelu(self.fc1(u0))
-        delta_u = self.fc2(hidden)
-        u_hat = u0 + self.residual_scale() * delta_u
-        corrected_symbols = real_features_to_complex(u_hat)
-        logits = self.constellation_logits(corrected_symbols)
-        if self.classifier is not None:
-            logits = logits + self.classifier(hidden).reshape(-1, self.num_symbols, 16)
-        aux = {
-            "eps_hat": torch.zeros(z0.shape[0], device=z0.device, dtype=torch.float32),
-            "bit_logits": qam16_symbol_logits_to_bit_logits(logits),
-            "cancellation_scale": torch.zeros((), device=z0.device, dtype=torch.float32),
-        }
-        return corrected_symbols, logits, aux
+def _complex_phase_features(symbols: torch.Tensor) -> torch.Tensor:
+    phase = torch.angle(symbols).to(torch.float32)
+    return torch.stack(
+        [
+            torch.real(symbols).to(torch.float32),
+            torch.imag(symbols).to(torch.float32),
+            torch.abs(symbols).to(torch.float32),
+            torch.cos(phase),
+            torch.sin(phase),
+        ],
+        dim=1,
+    )
 
 
 def stage1_geometry_logits(symbols: torch.Tensor) -> torch.Tensor:
@@ -595,199 +573,154 @@ def logits_margin(logits: torch.Tensor) -> torch.Tensor:
     return top2[..., 0] - top2[..., 1]
 
 
-def nearest_constellation_residual(symbols: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    base_logits = stage1_geometry_logits(symbols)
-    labels = torch.argmax(base_logits, dim=-1)
-    constellation = qam16_constellation_points(symbols.device, dtype=symbols.dtype)
-    nearest = constellation[labels]
-    residual = symbols - nearest
-    return residual, logits_margin(base_logits)
-
-
-class LocalSymbolResidualReceiver(nn.Module):
+class CfoEstimatorMmseReceiver(nn.Module):
     def __init__(
         self,
+        tx_basis: torch.Tensor,
+        rx_basis: torch.Tensor,
         num_symbols: int,
+        bits_per_symbol: int,
+        architecture: str = "LOCAL",
         channels: int = 32,
+        hidden_multiplier: int = 4,
         kernel_size: int = 5,
-        residual_scale_init: float = 0.1,
-        cancellation_scale_init: float = 0.1,
-        use_confidence_features: bool = True,
-        use_symbol_correction_head: bool = True,
-        use_residual_logit_head: bool = False,
         max_abs_eps: float = 0.1,
+        alpha_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if num_symbols <= 0:
             raise ValueError("num_symbols must be positive.")
+        if bits_per_symbol <= 0:
+            raise ValueError("bits_per_symbol must be positive.")
         if channels < 1:
             raise ValueError("channels must be positive.")
+        if hidden_multiplier < 1:
+            raise ValueError("hidden_multiplier must be at least 1.")
         if kernel_size < 1 or kernel_size % 2 == 0:
             raise ValueError("kernel_size must be a positive odd integer.")
-        if residual_scale_init <= 0.0:
-            raise ValueError("residual_scale_init must be positive.")
-        if cancellation_scale_init <= 0.0:
-            raise ValueError("cancellation_scale_init must be positive.")
         if max_abs_eps <= 0.0:
             raise ValueError("max_abs_eps must be positive.")
+        if alpha_scale <= 0.0:
+            raise ValueError("alpha_scale must be positive.")
 
+        architecture = architecture.upper()
+        if architecture not in {"DENSE", "LOCAL"}:
+            raise ValueError(f"Unsupported Stage 2 architecture: {architecture}")
+
+        self.register_buffer("tx_basis_buffer", tx_basis.detach().clone().to(torch.complex64))
+        self.register_buffer("rx_basis_buffer", rx_basis.detach().clone().to(torch.complex64))
         self.num_symbols = int(num_symbols)
+        self.bits_per_symbol = int(bits_per_symbol)
+        self.architecture = architecture
         self.channels = int(channels)
+        self.hidden_multiplier = int(hidden_multiplier)
         self.kernel_size = int(kernel_size)
-        self.use_confidence_features = bool(use_confidence_features)
-        self.use_symbol_correction_head = bool(use_symbol_correction_head)
-        self.use_residual_logit_head = bool(use_residual_logit_head)
-        self.feature_channels = 5 if self.use_confidence_features else 4
+        self.feature_channels = 5
         self.max_abs_eps = float(max_abs_eps)
-        padding = kernel_size // 2
+        self.alpha_scale = float(alpha_scale)
+        self.blend_param = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
-        self.cfo_head = nn.Sequential(
-            nn.Linear(self.feature_channels, self.channels),
-            nn.GELU(),
-            nn.Linear(self.channels, 1),
-        )
-        self.pass1_conv1 = nn.Conv1d(self.feature_channels + 1, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass1_conv2 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass1_conv3 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass1_logit_head = nn.Conv1d(self.channels, 16, kernel_size=1) if self.use_residual_logit_head else None
+        if self.architecture == "DENSE":
+            feature_dim = self.feature_channels * self.num_symbols
+            hidden_dim = feature_dim * self.hidden_multiplier
+            self.dense_head = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            nn.init.zeros_(self.dense_head[-1].weight)
+            nn.init.zeros_(self.dense_head[-1].bias)
+            self.conv1 = None
+            self.conv2 = None
+            self.conv3 = None
+            self.pool_head = None
+        else:
+            padding = kernel_size // 2
+            self.conv1 = nn.Conv1d(self.feature_channels, self.channels, kernel_size=kernel_size, padding=padding)
+            self.conv2 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
+            self.conv3 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
+            self.pool_head = nn.Sequential(
+                nn.Linear(self.channels, self.channels),
+                nn.GELU(),
+                nn.Linear(self.channels, 1),
+            )
+            nn.init.zeros_(self.pool_head[-1].weight)
+            nn.init.zeros_(self.pool_head[-1].bias)
+            self.dense_head = None
 
-        self.cancel_conv1 = nn.Conv1d(4, self.channels, kernel_size=kernel_size, padding=padding)
-        self.cancel_conv2 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.cancel_conv3 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.cancel_head = nn.Conv1d(self.channels, 2, kernel_size=1)
+    def tx_basis(self) -> torch.Tensor:
+        return self.tx_basis_buffer
 
-        self.pass2_conv1 = nn.Conv1d(self.feature_channels + 4, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass2_conv2 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass2_conv3 = nn.Conv1d(self.channels, self.channels, kernel_size=kernel_size, padding=padding)
-        self.pass2_logit_head = nn.Conv1d(self.channels, 16, kernel_size=1) if self.use_residual_logit_head else None
-        self.symbol_head = nn.Conv1d(self.channels, 2, kernel_size=1) if self.use_symbol_correction_head else None
-        self.log_residual_scale = nn.Parameter(torch.log(torch.tensor(float(residual_scale_init), dtype=torch.float32)))
-        self.log_cancellation_scale = nn.Parameter(
-            torch.log(torch.tensor(float(cancellation_scale_init), dtype=torch.float32))
-        )
-        nn.init.zeros_(self.cfo_head[-1].weight)
-        nn.init.zeros_(self.cfo_head[-1].bias)
-        if self.pass1_logit_head is not None:
-            nn.init.zeros_(self.pass1_logit_head.weight)
-            nn.init.zeros_(self.pass1_logit_head.bias)
-        nn.init.zeros_(self.cancel_head.weight)
-        nn.init.zeros_(self.cancel_head.bias)
-        if self.pass2_logit_head is not None:
-            nn.init.zeros_(self.pass2_logit_head.weight)
-            nn.init.zeros_(self.pass2_logit_head.bias)
-        if self.symbol_head is not None:
-            nn.init.zeros_(self.symbol_head.weight)
-            nn.init.zeros_(self.symbol_head.bias)
+    def rx_basis(self) -> torch.Tensor:
+        return self.rx_basis_buffer
 
     def residual_scale(self) -> torch.Tensor:
-        return torch.exp(self.log_residual_scale)
+        return torch.tanh(self.blend_param)
 
     def cancellation_scale(self) -> torch.Tensor:
-        return torch.exp(self.log_cancellation_scale)
+        return torch.zeros((), device=self.blend_param.device, dtype=torch.float32)
 
-    def _conv_stack(
-        self,
-        x: torch.Tensor,
-        conv1: nn.Conv1d,
-        conv2: nn.Conv1d,
-        conv3: nn.Conv1d,
-    ) -> torch.Tensor:
-        hidden = F.gelu(conv1(x))
-        hidden = F.gelu(conv2(hidden))
-        hidden = F.gelu(conv3(hidden))
-        return hidden
+    def _estimate_eps(self, z0: torch.Tensor) -> torch.Tensor:
+        features = _complex_phase_features(z0)
+        if self.architecture == "DENSE":
+            assert self.dense_head is not None
+            flat = torch.flatten(features, start_dim=1)
+            return torch.tanh(self.dense_head(flat).squeeze(-1)) * self.max_abs_eps
+        assert self.conv1 is not None and self.conv2 is not None and self.conv3 is not None and self.pool_head is not None
+        hidden = F.gelu(self.conv1(features))
+        hidden = F.gelu(self.conv2(hidden))
+        hidden = F.gelu(self.conv3(hidden))
+        pooled = torch.mean(hidden, dim=-1)
+        return torch.tanh(self.pool_head(pooled).squeeze(-1)) * self.max_abs_eps
 
-    def _feature_map(self, z0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        residual, margin = nearest_constellation_residual(z0)
-        feature_list = [
-            torch.real(z0),
-            torch.imag(z0),
-            torch.real(residual),
-            torch.imag(residual),
-        ]
-        if self.use_confidence_features:
-            feature_list.append(margin)
-        features = torch.stack(feature_list, dim=1).to(torch.float32)
-        base_logits = stage1_geometry_logits(z0)
-        return features, base_logits, margin.to(torch.float32)
-
-    def _estimate_eps(self, features: torch.Tensor) -> torch.Tensor:
-        pooled = torch.mean(features, dim=-1)
-        return torch.tanh(self.cfo_head(pooled).squeeze(-1)) * self.max_abs_eps
-
-    def _eps_channel(self, eps_hat: torch.Tensor) -> torch.Tensor:
-        return eps_hat.view(-1, 1, 1).expand(-1, 1, self.num_symbols)
-
-    def forward(self, z0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        features0, base_logits0, _ = self._feature_map(z0)
-        eps_hat = self._estimate_eps(features0)
-        eps_channel = self._eps_channel(eps_hat)
-        pass1_hidden = self._conv_stack(
-            torch.cat([features0, eps_channel], dim=1),
-            self.pass1_conv1,
-            self.pass1_conv2,
-            self.pass1_conv3,
-        )
-        logits1 = base_logits0
-        if self.pass1_logit_head is not None:
-            logits1 = logits1 + self.pass1_logit_head(pass1_hidden).permute(0, 2, 1).contiguous()
-        labels1 = torch.argmax(logits1, dim=-1)
-        tentative1 = qam16_symbols_from_labels(labels1, dtype=z0.dtype)
-        pass1_margin = logits_margin(logits1).to(torch.float32)
-
-        cancel_features = torch.stack(
-            [
-                torch.real(tentative1),
-                torch.imag(tentative1),
-                pass1_margin,
-                eps_channel[:, 0, :],
-            ],
-            dim=1,
-        ).to(torch.float32)
-        cancel_hidden = self._conv_stack(
-            cancel_features,
-            self.cancel_conv1,
-            self.cancel_conv2,
-            self.cancel_conv3,
-        )
-        cancel_delta = self.cancel_head(cancel_hidden)
-        cancel_complex = torch.complex(cancel_delta[:, 0, :], cancel_delta[:, 1, :]).to(torch.complex64)
-        z1 = z0 - self.cancellation_scale() * cancel_complex
-
-        features1, _, _ = self._feature_map(z1)
-        pass2_input = torch.cat(
-            [
-                features1,
-                eps_channel,
-                torch.real(tentative1).unsqueeze(1).to(torch.float32),
-                torch.imag(tentative1).unsqueeze(1).to(torch.float32),
-                pass1_margin.unsqueeze(1),
-            ],
-            dim=1,
-        )
-        hidden = self._conv_stack(
-            pass2_input,
-            self.pass2_conv1,
-            self.pass2_conv2,
-            self.pass2_conv3,
-        )
-
-        if self.symbol_head is None:
-            corrected_symbols = z1
-        else:
-            delta = self.symbol_head(hidden)
-            delta_u = torch.cat([delta[:, 0, :], delta[:, 1, :]], dim=-1)
-            corrected_symbols = real_features_to_complex(
-                complex_to_real_features(z1) + self.residual_scale() * delta_u
+    def _alpha_values(self, ebn0_db_values: float | torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:
+        if isinstance(ebn0_db_values, torch.Tensor):
+            noise_var = 1.0 / (
+                self.bits_per_symbol * torch.pow(10.0, ebn0_db_values.to(device=device, dtype=torch.float32) / 10.0)
             )
+            return self.alpha_scale * noise_var.to(torch.float32)
+        return torch.full(
+            (batch_size,),
+            float(self.alpha_scale * ebn0_to_noise_variance(float(ebn0_db_values), self.bits_per_symbol)),
+            device=device,
+            dtype=torch.float32,
+        )
+
+    def _mmse_solve(
+        self,
+        z0: torch.Tensor,
+        eps_hat: torch.Tensor,
+        ebn0_db_values: float | torch.Tensor,
+    ) -> torch.Tensor:
+        operator = effective_operator(self.tx_basis(), self.rx_basis(), eps_hat)
+        ah = torch.conj(torch.transpose(operator, -2, -1))
+        alpha = self._alpha_values(ebn0_db_values, z0.shape[0], z0.device).view(-1, 1, 1)
+        eye = torch.eye(self.num_symbols, device=z0.device, dtype=operator.dtype).unsqueeze(0)
+        lhs = ah @ operator + alpha.to(operator.dtype) * eye
+        rhs = ah @ z0.unsqueeze(-1)
+        return torch.linalg.solve(lhs, rhs).squeeze(-1)
+
+    def forward(
+        self,
+        z0: torch.Tensor,
+        ebn0_db_values: float | torch.Tensor,
+        eps_override: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if eps_override is None:
+            eps_hat = self._estimate_eps(z0)
+        else:
+            eps_hat = eps_override.to(device=z0.device, dtype=torch.float32)
+        solved_symbols = self._mmse_solve(z0, eps_hat, ebn0_db_values)
+        blend = self.residual_scale().to(z0.dtype)
+        corrected_symbols = z0 + blend * (solved_symbols - z0)
         logits = stage1_geometry_logits(corrected_symbols)
-        if self.pass2_logit_head is not None:
-            logits = logits + self.pass2_logit_head(hidden).permute(0, 2, 1).contiguous()
         aux = {
             "eps_hat": eps_hat.to(torch.float32),
             "bit_logits": qam16_symbol_logits_to_bit_logits(logits),
             "cancellation_scale": self.cancellation_scale().to(torch.float32),
-            "pass1_logits": logits1,
+            "solver_blend": self.residual_scale().to(torch.float32),
         }
         return corrected_symbols, logits, aux
 
@@ -816,13 +749,18 @@ class JointStage2Model(nn.Module):
         eps_values: torch.Tensor,
         config: ExperimentConfig,
         ebn0_db_values: float | torch.Tensor,
+        oracle_eps_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         tx_basis = self.tx_basis()
         rx_basis = self.rx_basis()
         tx_signal = transmit_symbols(symbols, tx_basis)
         rx_signal, _ = propagate(tx_signal, eps_values, config, ebn0_db=ebn0_db_values)
         z0 = decode_symbols(rx_signal, rx_basis)
-        corrected_symbols, logits, aux = self.nonlinear_receiver(z0)
+        corrected_symbols, logits, aux = self.nonlinear_receiver(
+            z0,
+            ebn0_db_values=ebn0_db_values,
+            eps_override=oracle_eps_override,
+        )
         return corrected_symbols, logits, z0, aux
 
 
@@ -1099,72 +1037,24 @@ def _stage2_dual_head_loss(
     bit_targets = bits.to(torch.float32)
     loss_ce = torch.zeros((), device=logits.device, dtype=torch.float32)
     loss_bce = torch.zeros((), device=logits.device, dtype=torch.float32)
-    if baseline_logits is None:
-        if config.stage2_decision_loss == "BIT_BCE":
-            bce_terms = F.binary_cross_entropy_with_logits(bit_logits, bit_targets, reduction="none")
-            loss_decision = bce_terms.mean()
-            loss_bce = loss_decision
-        else:
-            flat_logits = logits.reshape(-1, 16)
-            flat_labels = labels.reshape(-1)
-            ce_terms = F.cross_entropy(flat_logits, flat_labels, reduction="none").reshape(labels.shape)
-            loss_decision = ce_terms.mean()
-            loss_ce = loss_decision
-        loss_guard = torch.zeros((), device=logits.device, dtype=torch.float32)
+    if config.stage2_decision_loss == "BIT_BCE":
+        bce_terms = F.binary_cross_entropy_with_logits(bit_logits, bit_targets, reduction="none")
+        loss_decision = bce_terms.mean()
+        loss_bce = loss_decision
     else:
-        baseline_pred = torch.argmax(baseline_logits, dim=-1)
-        confidence = logits_margin(baseline_logits)
-        hard_mask = (baseline_pred != labels).to(torch.float32)
-        confidence_weight = torch.exp(-confidence).clamp_min(0.25)
-        symbol_weights = 1.0 + hard_mask + confidence_weight
-        if config.stage2_decision_loss == "BIT_BCE":
-            bce_terms = F.binary_cross_entropy_with_logits(bit_logits, bit_targets, reduction="none")
-            bit_weights = symbol_weights.unsqueeze(-1)
-            loss_decision = torch.sum(bce_terms * bit_weights) / bit_weights.sum().clamp_min(1e-12)
-            loss_bce = loss_decision
-        else:
-            flat_logits = logits.reshape(-1, 16)
-            flat_labels = labels.reshape(-1)
-            ce_terms = F.cross_entropy(flat_logits, flat_labels, reduction="none").reshape(labels.shape)
-            loss_decision = torch.sum(ce_terms * symbol_weights) / symbol_weights.sum().clamp_min(1e-12)
-            loss_ce = loss_decision
-
-        easy_mask = (baseline_pred == labels) & (confidence >= config.stage2_easy_margin_threshold)
-        if torch.any(easy_mask):
-            if config.stage2_decision_loss == "BIT_BCE":
-                baseline_bit_logits = qam16_symbol_logits_to_bit_logits(baseline_logits)
-                baseline_true_margin = torch.where(bits.to(torch.bool), baseline_bit_logits, -baseline_bit_logits)
-                current_true_margin = torch.where(bits.to(torch.bool), bit_logits, -bit_logits)
-                easy_weight = easy_mask.to(torch.float32).unsqueeze(-1)
-                loss_guard = torch.sum(
-                    F.relu(
-                        baseline_true_margin
-                        - current_true_margin
-                        + config.stage2_easy_consistency_margin
-                    )
-                    * easy_weight
-                ) / easy_weight.sum().clamp_min(1e-12)
-            else:
-                baseline_true = torch.gather(baseline_logits, -1, labels.unsqueeze(-1)).squeeze(-1)
-                current_true = torch.gather(logits, -1, labels.unsqueeze(-1)).squeeze(-1)
-                loss_guard = torch.sum(
-                    F.relu(baseline_true - current_true + config.stage2_easy_consistency_margin)
-                    * easy_mask.to(torch.float32)
-                ) / easy_mask.to(torch.float32).sum().clamp_min(1e-12)
-        else:
-            loss_guard = torch.zeros((), device=logits.device, dtype=torch.float32)
+        flat_logits = logits.reshape(-1, 16)
+        flat_labels = labels.reshape(-1)
+        ce_terms = F.cross_entropy(flat_logits, flat_labels, reduction="none").reshape(labels.shape)
+        loss_decision = ce_terms.mean()
+        loss_ce = loss_decision
+    loss_guard = torch.zeros((), device=logits.device, dtype=torch.float32)
     loss_mse = normalized_symbol_mse(corrected_symbols, ref_symbols)
     if eps_hat is None or eps_true is None:
         loss_eps = torch.zeros((), device=logits.device, dtype=torch.float32)
     else:
         eps_scale = _stage2_max_abs_cfo(config)
         loss_eps = torch.mean(((eps_hat - eps_true.to(torch.float32)) / eps_scale) ** 2)
-    total = (
-        loss_decision
-        + config.stage2_loss_mse_weight * loss_mse
-        + config.stage2_noninferiority_weight * loss_guard
-        + config.stage2_cfo_loss_weight * loss_eps
-    )
+    total = loss_decision + config.stage2_loss_mse_weight * loss_mse + config.stage2_cfo_loss_weight * loss_eps
     return total, {
         "Ldecision": loss_decision,
         "Lbce": loss_bce,
@@ -1193,6 +1083,7 @@ def _stage2_hard_cfo_weighted_ber(
     bits: torch.Tensor,
     symbols: torch.Tensor,
     ebn0_db_values: float | torch.Tensor,
+    oracle_eps_conditioning: bool = False,
 ) -> torch.Tensor:
     weights = torch.tensor(config.stage2_selection_abs_cfo_weights, device=config.device, dtype=torch.float32)
     weights = weights / weights.sum().clamp_min(1e-12)
@@ -1200,8 +1091,10 @@ def _stage2_hard_cfo_weighted_ber(
     for abs_eps, weight in zip(config.stage2_selection_abs_cfo_points, weights):
         eps_pos = torch.full((symbols.shape[0],), float(abs_eps), device=config.device, dtype=torch.float32)
         eps_neg = torch.full((symbols.shape[0],), -float(abs_eps), device=config.device, dtype=torch.float32)
-        _, logits_pos, _, aux_pos = model(symbols, eps_pos, config, ebn0_db_values)
-        _, logits_neg, _, aux_neg = model(symbols, eps_neg, config, ebn0_db_values)
+        oracle_eps_pos = eps_pos if oracle_eps_conditioning else None
+        oracle_eps_neg = eps_neg if oracle_eps_conditioning else None
+        _, logits_pos, _, aux_pos = model(symbols, eps_pos, config, ebn0_db_values, oracle_eps_override=oracle_eps_pos)
+        _, logits_neg, _, aux_neg = model(symbols, eps_neg, config, ebn0_db_values, oracle_eps_override=oracle_eps_neg)
         ber_pos = torch.mean((_stage2_bits_from_outputs(logits_pos, aux_pos) != bits).to(torch.float32))
         ber_neg = torch.mean((_stage2_bits_from_outputs(logits_neg, aux_neg) != bits).to(torch.float32))
         total = total + weight * 0.5 * (ber_pos + ber_neg)
@@ -1214,6 +1107,7 @@ def _stage2_hard_cfo_weighted_loss(
     bits: torch.Tensor,
     symbols: torch.Tensor,
     ebn0_db_values: float | torch.Tensor,
+    oracle_eps_conditioning: bool = False,
 ) -> torch.Tensor:
     weights = torch.tensor(config.stage2_selection_abs_cfo_weights, device=config.device, dtype=torch.float32)
     weights = weights / weights.sum().clamp_min(1e-12)
@@ -1221,7 +1115,14 @@ def _stage2_hard_cfo_weighted_loss(
     for abs_eps, weight in zip(config.stage2_selection_abs_cfo_points, weights):
         for signed_eps in (float(abs_eps), -float(abs_eps)):
             eps_values = torch.full((symbols.shape[0],), signed_eps, device=config.device, dtype=torch.float32)
-            corrected_symbols, logits, z0, aux = model(symbols, eps_values, config, ebn0_db_values)
+            oracle_eps = eps_values if oracle_eps_conditioning else None
+            corrected_symbols, logits, z0, aux = model(
+                symbols,
+                eps_values,
+                config,
+                ebn0_db_values,
+                oracle_eps_override=oracle_eps,
+            )
             base_logits = stage1_geometry_logits(z0)
             ce_total, _ = _stage2_dual_head_loss(
                 config=config,
@@ -1256,15 +1157,14 @@ def _stage2_total_loss(
     operator_loss_weights: torch.Tensor | None,
     include_spectral_loss: bool,
     optimize_operator_terms: bool,
+    oracle_eps_conditioning: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    baseline_logits = stage1_geometry_logits(z0)
     dual_total, dual_components = _stage2_dual_head_loss(
         config,
         corrected_symbols,
         logits,
         bits,
         ref_symbols,
-        baseline_logits=baseline_logits,
         bit_logits=aux.get("bit_logits"),
         eps_hat=aux.get("eps_hat"),
         eps_true=eps_values,
@@ -1287,8 +1187,8 @@ def _stage2_total_loss(
         device=tx_basis.device,
         dtype=torch.float32,
     )
-    loss_hard = _stage2_hard_cfo_weighted_loss(config, model, bits, ref_symbols, ebn0_db_values)
-    total = dual_total + config.stage2_hard_cfo_loss_weight * loss_hard
+    loss_hard = torch.zeros((), device=tx_basis.device, dtype=torch.float32)
+    total = dual_total
     if optimize_operator_terms:
         total = (
             total
@@ -1435,6 +1335,7 @@ def _run_stage2_training_stage(
     train_tx: bool,
     train_rx: bool,
     include_spectral_loss: bool,
+    oracle_eps_conditioning: bool,
     global_epoch_start: int,
     history: list[dict[str, float | int | str]],
 ) -> tuple[dict[str, object], dict[str, float | int | str | bool | None], int]:
@@ -1473,7 +1374,14 @@ def _run_stage2_training_stage(
         bits, symbols = sample_training_symbols(config.train_symbol_batch_size, config)
         eps_values = _sample_training_cfo_values(config, stage, config.train_symbol_batch_size)
         ebn0_values = _sample_training_ebn0_values(config, config.train_symbol_batch_size)
-        corrected_symbols, logits, z0, aux = model(symbols, eps_values, config, ebn0_values)
+        oracle_eps = eps_values if oracle_eps_conditioning else None
+        corrected_symbols, logits, z0, aux = model(
+            symbols,
+            eps_values,
+            config,
+            ebn0_values,
+            oracle_eps_override=oracle_eps,
+        )
         tx_basis = model.tx_basis()
         rx_basis = model.rx_basis()
         eps_batch, operator_loss_weights = _stage_operator_loss_support(config, stage)
@@ -1497,6 +1405,7 @@ def _run_stage2_training_stage(
             operator_loss_weights,
             include_spectral_loss=include_spectral_loss,
             optimize_operator_terms=optimize_operator_terms,
+            oracle_eps_conditioning=oracle_eps_conditioning,
         )
 
         optimizer.zero_grad()
@@ -1513,7 +1422,14 @@ def _run_stage2_training_stage(
             continue
 
         with torch.no_grad():
-            corrected_val, logits_val, z0_val, aux_val = model(val_symbols, val_eps, config, val_ebn0)
+            oracle_val_eps = val_eps if oracle_eps_conditioning else None
+            corrected_val, logits_val, z0_val, aux_val = model(
+                val_symbols,
+                val_eps,
+                config,
+                val_ebn0,
+                oracle_eps_override=oracle_val_eps,
+            )
             tx_val = model.tx_basis()
             rx_val = model.rx_basis()
             operator_clean_val = effective_operator(tx_val, rx_val, torch.tensor([0.0], device=config.device))
@@ -1536,6 +1452,7 @@ def _run_stage2_training_stage(
                 validation_weights,
                 include_spectral_loss=include_spectral_loss,
                 optimize_operator_terms=optimize_operator_terms,
+                oracle_eps_conditioning=oracle_eps_conditioning,
             )
             val_bits_hat = _stage2_bits_from_outputs(logits_val, aux_val)
             val_ber = torch.mean((val_bits_hat != val_bits).to(torch.float32)).item()
@@ -1589,6 +1506,7 @@ def _run_stage2_training_stage(
                     val_bits,
                     val_symbols,
                     val_ebn0,
+                    oracle_eps_conditioning=oracle_eps_conditioning,
                 ).item(),
                 "baseline_hard_cfo_weighted_ber": val_stage1_hard_ber,
                 "residual_scale": model.nonlinear_receiver.residual_scale().item(),
@@ -1626,7 +1544,14 @@ def _run_stage2_training_stage(
         rx_final = model.rx_basis().detach().clone()
         operator_clean = effective_operator(tx_final, rx_final, torch.tensor([0.0], device=config.device))
         operator_stage = effective_operator(tx_final, rx_final, validation_eps)
-        corrected_val, logits_val, z0_val, aux_val = model(val_symbols, val_eps, config, val_ebn0)
+        oracle_val_eps = val_eps if oracle_eps_conditioning else None
+        corrected_val, logits_val, z0_val, aux_val = model(
+            val_symbols,
+            val_eps,
+            config,
+            val_ebn0,
+            oracle_eps_override=oracle_val_eps,
+        )
         val_total, val_components = _stage2_total_loss(
             config,
             model,
@@ -1645,6 +1570,7 @@ def _run_stage2_training_stage(
             validation_weights,
             include_spectral_loss=include_spectral_loss,
             optimize_operator_terms=optimize_operator_terms,
+            oracle_eps_conditioning=oracle_eps_conditioning,
         )
         stage_row = {
             "scheme": scheme_name,
@@ -1675,7 +1601,14 @@ def _run_stage2_training_stage(
             "val_ber": float(torch.mean((_stage2_bits_from_outputs(logits_val, aux_val) != val_bits).to(torch.float32)).item()),
             "val_ser": float(_stage2_symbol_error_rate(logits_val, val_bits).item()),
             "hard_cfo_weighted_ber": float(
-                _stage2_hard_cfo_weighted_ber(config, model, val_bits, val_symbols, val_ebn0).item()
+                _stage2_hard_cfo_weighted_ber(
+                    config,
+                    model,
+                    val_bits,
+                    val_symbols,
+                    val_ebn0,
+                    oracle_eps_conditioning=oracle_eps_conditioning,
+                ).item()
             ),
             "baseline_hard_cfo_weighted_ber": float(val_stage1_hard_ber),
             "residual_scale": float(model.nonlinear_receiver.residual_scale().item()),
@@ -1714,6 +1647,7 @@ def train_stage2_nonlinear_receiver(
     rx_basis: torch.Tensor,
     scheme_name: str,
     seed_offset: int = 0,
+    oracle_eps_conditioning: bool = False,
 ) -> Stage2ReceiverTrainingResult:
     _require_stage2_supported_config(config)
     set_seed(config.base_seed + seed_offset)
@@ -1721,25 +1655,17 @@ def train_stage2_nonlinear_receiver(
     tx_basis = tx_basis.detach().clone().to(config.device)
     rx_basis = rx_basis.detach().clone().to(config.device)
     tx_init, tx_support_frame = _recover_stage1_tx_init(config, tx_basis)
-    if config.stage2_detector_arch == "DENSE":
-        receiver = DenseSymbolResidualReceiver(
-            num_symbols=config.N,
-            hidden_multiplier=config.stage2_hidden_multiplier,
-            residual_scale_init=config.stage2_residual_scale_init,
-            use_residual_logit_head=config.stage2_use_residual_logit_head,
-        ).to(config.device)
-    else:
-        receiver = LocalSymbolResidualReceiver(
-            num_symbols=config.N,
-            channels=config.stage2_local_channels,
-            kernel_size=config.stage2_local_kernel_size,
-            residual_scale_init=config.stage2_residual_scale_init,
-            cancellation_scale_init=config.stage2_cancellation_scale_init,
-            use_confidence_features=config.stage2_use_confidence_features,
-            use_symbol_correction_head=config.stage2_use_symbol_correction_head,
-            use_residual_logit_head=config.stage2_use_residual_logit_head,
-            max_abs_eps=_stage2_max_abs_cfo(config),
-        ).to(config.device)
+    receiver = CfoEstimatorMmseReceiver(
+        tx_basis=tx_basis,
+        rx_basis=rx_basis,
+        num_symbols=config.N,
+        bits_per_symbol=config.bits_per_symbol,
+        architecture=config.stage2_detector_arch,
+        channels=config.stage2_local_channels,
+        hidden_multiplier=config.stage2_hidden_multiplier,
+        kernel_size=config.stage2_local_kernel_size,
+        max_abs_eps=_stage2_max_abs_cfo(config),
+    ).to(config.device)
     model = JointStage2Model(
         tx_init=tx_init,
         rx_init=rx_basis,
@@ -1767,113 +1693,24 @@ def train_stage2_nonlinear_receiver(
             f"bit_logit_diff={identity_diag['identity_max_bit_logit_abs_diff']:.4e}"
         ),
     )
-    if config.stage2_workflow == "NONLINEAR_ONLY":
-        _, stage_row, global_epoch = _run_stage2_training_stage(
-            config=config,
-            model=model,
-            stage=StageSpec("NonlinearOnly", config.stage2_nonlinear_only_epochs, config.stage_c_cfo, True),
-            scheme_name=scheme_name,
-            epochs=config.stage2_nonlinear_only_epochs,
-            learning_rate=config.stage2_nonlinear_only_learning_rate,
-            baseline_tx_basis=tx_basis,
-            baseline_rx_basis=rx_basis,
-            train_tx=False,
-            train_rx=False,
-            include_spectral_loss=False,
-            global_epoch_start=global_epoch,
-            history=history,
-        )
-        stage_row.update(identity_diag)
-        stage_rows.append(stage_row)
-    else:
-        _, warmstart_row, global_epoch = _run_stage2_training_stage(
-            config=config,
-            model=model,
-            stage=StageSpec("Warmstart", config.stage2_warmstart_epochs, config.stage_c_cfo, True),
-            scheme_name=scheme_name,
-            epochs=config.stage2_warmstart_epochs,
-            learning_rate=config.stage2_warmstart_learning_rate,
-            baseline_tx_basis=tx_basis,
-            baseline_rx_basis=rx_basis,
-            train_tx=False,
-            train_rx=False,
-            include_spectral_loss=False,
-            global_epoch_start=global_epoch,
-            history=history,
-        )
-        warmstart_row.update(identity_diag)
-        stage_rows.append(warmstart_row)
-        baseline_hard_ber = float(warmstart_row["baseline_hard_cfo_weighted_ber"])
-        detector_won = warmstart_row["hard_cfo_weighted_ber"] < baseline_hard_ber - config.stage2_reopen_v_gain_tol
-        should_reopen_v = config.stage2_reopen_v_after_win and (
-            detector_won or not config.stage2_reopen_v_requires_gain
-        )
-        if should_reopen_v:
-            _, reopen_row, global_epoch = _run_stage2_training_stage(
-                config=config,
-                model=model,
-                stage=StageSpec("ReopenV", config.stage2_reopen_v_epochs, config.stage_c_cfo, True),
-                scheme_name=scheme_name,
-                epochs=config.stage2_reopen_v_epochs,
-                learning_rate=config.stage2_reopen_v_learning_rate,
-                baseline_tx_basis=tx_basis,
-                baseline_rx_basis=rx_basis,
-                train_tx=False,
-                train_rx=True,
-                include_spectral_loss=False,
-                global_epoch_start=global_epoch,
-                history=history,
-            )
-            reopen_row.update(identity_diag)
-            stage_rows.append(reopen_row)
-        else:
-            stage_rows.append(
-                {
-                    "scheme": scheme_name,
-                    "stage": "ReopenV",
-                    "modulation": config.modulation,
-                    "N": config.N,
-                    "M": config.M,
-                    "train_ebn0_db": config.train_ebn0_db,
-                    "eval_ebn0_db": config.eval_ebn0_db,
-                    "epochs": config.stage2_reopen_v_epochs,
-                    "cfo_span": config.stage_c_cfo,
-                    "best_global_epoch": int(global_epoch),
-                    "best_stage_epoch": 0,
-                    "val_total": float("nan"),
-                    "val_Ldecision": float("nan"),
-                    "val_Lbce": float("nan"),
-                    "val_Lce": float("nan"),
-                    "val_Lmse": float("nan"),
-                    "val_Lguard": float("nan"),
-                    "val_Leps": float("nan"),
-                    "val_Lhard": float("nan"),
-                    "val_L0": float("nan"),
-                    "val_Loff": float("nan"),
-                    "val_Ldiag": float("nan"),
-                    "val_LV": float("nan"),
-                    "val_Lnn": float("nan"),
-                    "val_Lspec": float("nan"),
-                    "val_ber": float("nan"),
-                    "val_ser": float("nan"),
-                    "hard_cfo_weighted_ber": float("nan"),
-                    "baseline_hard_cfo_weighted_ber": float(baseline_hard_ber),
-                    "residual_scale": float(model.nonlinear_receiver.residual_scale().item()),
-                    "cancellation_scale": float("nan"),
-                    "eps_hat_mae": float("nan"),
-                    "clean_identity_loss": float("nan"),
-                    "clean_offdiag_leakage": float("nan"),
-                    "mean_validation_offdiag": float("nan"),
-                    "mean_validation_diag_loss": float("nan"),
-                    "mean_validation_local_leakage": float("nan"),
-                    "validation_symbol_loss": float("nan"),
-                    "validation_spectral_loss": float("nan"),
-                    "receiver_fro_norm_sq": float("nan"),
-                    "stage_failed": False,
-                    "stop_reason": "Skipped because nonlinear-only did not beat stage1_linear on the hard-CFO target.",
-                    **identity_diag,
-                }
-            )
+    _, stage_row, global_epoch = _run_stage2_training_stage(
+        config=config,
+        model=model,
+        stage=StageSpec("FrozenPostV", config.stage2_nonlinear_only_epochs, config.stage_c_cfo, True),
+        scheme_name=scheme_name,
+        epochs=config.stage2_nonlinear_only_epochs,
+        learning_rate=config.stage2_nonlinear_only_learning_rate,
+        baseline_tx_basis=tx_basis,
+        baseline_rx_basis=rx_basis,
+        train_tx=False,
+        train_rx=False,
+        include_spectral_loss=False,
+        oracle_eps_conditioning=oracle_eps_conditioning,
+        global_epoch_start=global_epoch,
+        history=history,
+    )
+    stage_row.update(identity_diag)
+    stage_rows.append(stage_row)
     model.nonlinear_receiver.eval()
     return Stage2ReceiverTrainingResult(
         receiver=model.nonlinear_receiver,
@@ -1889,12 +1726,16 @@ def detect_scheme_symbols(
     scheme: EvaluationScheme,
     rx_signal: torch.Tensor,
     eps_tensor: torch.Tensor | None = None,
+    ebn0_db: float | torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor | float]:
     rx_basis = scheme.rx_basis
     pilot_symbol_mse = float("nan")
     cfo_est_mae = float("nan")
     cfo_est_bias = float("nan")
     mean_estimated_eps = float("nan")
+    stage2_eps_hat_mae = float("nan")
+    stage2_eps_hat_bias = float("nan")
+    stage2_eps_hat_mean = float("nan")
 
     if config.frame_structure_enabled and config.pilot_estimation_enabled and not config.payload_region_enabled:
         estimated_eps, pilot_mse = estimate_residual_cfo_from_pilots(config, rx_signal, rx_basis)
@@ -1906,13 +1747,44 @@ def detect_scheme_symbols(
             cfo_est_bias = float(torch.mean(cfo_error).item())
             mean_estimated_eps = float(torch.mean(estimated_eps).item())
 
+    if scheme.oracle_pre_v_cfo:
+        if eps_tensor is None:
+            raise ValueError("oracle_pre_v_cfo requires the true residual CFO tensor.")
+        rx_signal = apply_residual_cfo(rx_signal, -eps_tensor)
+
     z0 = decode_symbols(rx_signal, rx_basis)
     logits = None
-    if scheme.nonlinear_receiver is not None:
-        corrected_symbols, logits, aux = scheme.nonlinear_receiver(z0)
+    if scheme.oracle_post_v_mmse:
+        if eps_tensor is None:
+            raise ValueError("oracle_post_v_mmse requires the true residual CFO tensor.")
+        if ebn0_db is None:
+            raise ValueError("oracle_post_v_mmse requires the active Eb/N0 for regularization.")
+        alpha = scheme.oracle_mmse_alpha
+        if alpha is None:
+            if isinstance(ebn0_db, torch.Tensor):
+                alpha = float(torch.mean(1.0 / (config.bits_per_symbol * torch.pow(10.0, ebn0_db.to(torch.float32) / 10.0))).item())
+            else:
+                alpha = ebn0_to_noise_variance(float(ebn0_db), config.bits_per_symbol)
+        corrected_symbols = oracle_symbol_mmse_equalize(z0, scheme.tx_basis, scheme.rx_basis, eps_tensor, alpha)
+        aux = {}
+        bits_hat_full, _ = slice_symbols(corrected_symbols, config.modulation)
+    elif scheme.nonlinear_receiver is not None:
+        oracle_eps = eps_tensor if scheme.oracle_eps_conditioning else None
+        if ebn0_db is None:
+            raise ValueError("Nonlinear Stage 2 inference requires the active Eb/N0 for regularization.")
+        corrected_symbols, logits, aux = scheme.nonlinear_receiver(
+            z0,
+            ebn0_db_values=ebn0_db,
+            eps_override=oracle_eps,
+        )
         if config.modulation != "16QAM":
             raise ValueError("Nonlinear receiver inference is currently implemented only for 16QAM.")
         bits_hat_full = _stage2_bits_from_outputs(logits, aux)
+        if eps_tensor is not None and "eps_hat" in aux:
+            eps_error = aux["eps_hat"].to(torch.float32) - eps_tensor.to(torch.float32)
+            stage2_eps_hat_mae = float(torch.mean(torch.abs(eps_error)).item())
+            stage2_eps_hat_bias = float(torch.mean(eps_error).item())
+            stage2_eps_hat_mean = float(torch.mean(aux["eps_hat"].to(torch.float32)).item())
     else:
         corrected_symbols = z0
         aux = {}
@@ -1934,7 +1806,9 @@ def detect_scheme_symbols(
         "cfo_est_mae": cfo_est_mae,
         "cfo_est_bias": cfo_est_bias,
         "mean_estimated_eps": mean_estimated_eps,
-        "stage2_eps_hat_mean": float(aux.get("eps_hat", torch.zeros(1, device=rx_signal.device)).mean().item()),
+        "stage2_eps_hat_mae": stage2_eps_hat_mae,
+        "stage2_eps_hat_bias": stage2_eps_hat_bias,
+        "stage2_eps_hat_mean": stage2_eps_hat_mean,
     }
 
 
@@ -1950,7 +1824,7 @@ def evaluate_single(
     eps_tensor = torch.full((symbols.shape[0],), float(eps), device=symbols.device, dtype=torch.float32)
     tx_signal = transmit_symbols(symbols, scheme.tx_basis)
     rx_signal, _ = propagate(tx_signal, eps_tensor, config, ebn0_db=ebn0_db, noise=noise)
-    outputs = detect_scheme_symbols(config, scheme, rx_signal, eps_tensor=eps_tensor)
+    outputs = detect_scheme_symbols(config, scheme, rx_signal, eps_tensor=eps_tensor, ebn0_db=ebn0_db)
     shat_data = outputs["symbol_estimates"]
     bits_hat = outputs["bits_hat"]
 
@@ -1978,6 +1852,9 @@ def evaluate_single(
         "cfo_est_mae": float(outputs["cfo_est_mae"]),
         "cfo_est_bias": float(outputs["cfo_est_bias"]),
         "mean_estimated_eps": float(outputs["mean_estimated_eps"]),
+        "stage2_eps_hat_mae": float(outputs["stage2_eps_hat_mae"]),
+        "stage2_eps_hat_bias": float(outputs["stage2_eps_hat_bias"]),
+        "stage2_eps_hat_mean": float(outputs["stage2_eps_hat_mean"]),
     }
 
 
@@ -2021,7 +1898,11 @@ def evaluate_scheme_set(
                 "cfo_est_mae_sum": 0.0,
                 "cfo_est_bias_sum": 0.0,
                 "mean_estimated_eps_sum": 0.0,
+                "stage2_eps_hat_mae_sum": 0.0,
+                "stage2_eps_hat_bias_sum": 0.0,
+                "stage2_eps_hat_mean_sum": 0.0,
                 "pilot_batches": 0,
+                "stage2_batches": 0,
             }
             for name in schemes
         }
@@ -2055,6 +1936,11 @@ def evaluate_scheme_set(
                     accum[name]["cfo_est_bias_sum"] += metrics["cfo_est_bias"]
                     accum[name]["mean_estimated_eps_sum"] += metrics["mean_estimated_eps"]
                     accum[name]["pilot_batches"] += 1
+                if np.isfinite(metrics["stage2_eps_hat_mae"]):
+                    accum[name]["stage2_eps_hat_mae_sum"] += metrics["stage2_eps_hat_mae"]
+                    accum[name]["stage2_eps_hat_bias_sum"] += metrics["stage2_eps_hat_bias"]
+                    accum[name]["stage2_eps_hat_mean_sum"] += metrics["stage2_eps_hat_mean"]
+                    accum[name]["stage2_batches"] += 1
             remaining -= bsz
             processed += bsz
             if progress_label and processed in progress_marks:
@@ -2068,6 +1954,7 @@ def evaluate_scheme_set(
         for name in schemes:
             entry = accum[name]
             pilot_count = max(entry["pilot_batches"], 1)
+            stage2_count = max(entry["stage2_batches"], 1)
             rows.append(
                 {
                     "method": name,
@@ -2096,6 +1983,15 @@ def evaluate_scheme_set(
                     "cfo_est_bias": entry["cfo_est_bias_sum"] / pilot_count if entry["pilot_batches"] > 0 else np.nan,
                     "mean_estimated_eps": (
                         entry["mean_estimated_eps_sum"] / pilot_count if entry["pilot_batches"] > 0 else np.nan
+                    ),
+                    "stage2_eps_hat_mae": (
+                        entry["stage2_eps_hat_mae_sum"] / stage2_count if entry["stage2_batches"] > 0 else np.nan
+                    ),
+                    "stage2_eps_hat_bias": (
+                        entry["stage2_eps_hat_bias_sum"] / stage2_count if entry["stage2_batches"] > 0 else np.nan
+                    ),
+                    "stage2_eps_hat_mean": (
+                        entry["stage2_eps_hat_mean_sum"] / stage2_count if entry["stage2_batches"] > 0 else np.nan
                     ),
                 }
             )
