@@ -31,6 +31,7 @@ def build_stage2_joint_config(
         stage2_enabled=True,
         stage2_workflow="JOINT",
         stage2_detector_arch="LOCAL",
+        stage2_decision_loss="BIT_BCE",
         stage2_checkpoint_path=Path(stage1_checkpoint_path),
     )
 
@@ -45,11 +46,13 @@ def control_lines(config: ExperimentConfig) -> list[str]:
         f"- Workflow: `joint`",
         f"- Train SNR: `{config.train_ebn0_db:.1f} dB`, train range `[{config.train_ebn0_db_min:.1f}, {config.train_ebn0_db_max:.1f}] dB`, eval SNR `{config.eval_ebn0_db:.1f} dB`",
         f"- Detector-first stage: epochs `{config.stage2_warmstart_epochs}`, lr `{config.stage2_warmstart_learning_rate}`, freeze `W` and `V`",
+        f"- Decision loss: `{config.stage2_decision_loss}`",
         f"- Reopen-V stage: enabled `{config.stage2_reopen_v_after_win}`, require detector win `{config.stage2_reopen_v_requires_gain}`, "
         f"gain tolerance `{config.stage2_reopen_v_gain_tol}`, epochs `{config.stage2_reopen_v_epochs}`, lr `{config.stage2_reopen_v_learning_rate}`",
         f"- Detector: `{config.stage2_detector_arch.lower()}` with channels `{config.stage2_local_channels}`, kernel `{config.stage2_local_kernel_size}`, residual scale init `{config.stage2_residual_scale_init}`, cancellation scale init `{config.stage2_cancellation_scale_init}`",
-        f"- Features: confidence `{config.stage2_use_confidence_features}`, symbol correction head `{config.stage2_use_symbol_correction_head}`",
+        f"- Features: confidence `{config.stage2_use_confidence_features}`, symbol correction head `{config.stage2_use_symbol_correction_head}`, residual logit head `{config.stage2_use_residual_logit_head}`",
         f"- Losses: CFO aux `{config.stage2_cfo_loss_weight}`, hard-CFO weight `{config.stage2_hard_cfo_loss_weight}`, non-inferiority `{config.stage2_noninferiority_weight}`, eta `{config.stage2_loss_mse_weight}`",
+        f"- Frozen-front-end operator terms logged only: `{config.stage2_detector_only_logs_operator_terms}`",
         f"- Hard-CFO checkpoint target: abs CFO `{config.stage2_selection_abs_cfo_points}` with weights `{config.stage2_selection_abs_cfo_weights}`",
     ]
     if not resource_df.empty:

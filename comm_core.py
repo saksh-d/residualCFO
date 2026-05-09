@@ -17,6 +17,7 @@ SUPPORTED_MODULATIONS = ("QPSK", "16QAM")
 SUPPORTED_TONE_PATTERNS = ("CONTIGUOUS", "SPREAD")
 SUPPORTED_STAGE2_WORKFLOWS = ("NONLINEAR_ONLY", "JOINT")
 SUPPORTED_STAGE2_DETECTORS = ("DENSE", "LOCAL")
+SUPPORTED_STAGE2_DECISION_LOSSES = ("SYMBOL_CE", "BIT_BCE")
 
 
 def modulation_bits_per_symbol(modulation: str) -> int:
@@ -79,6 +80,7 @@ class ExperimentConfig:
     stage1_clean_leakage_tol: float = 1e-3
     stage1_zero_cfo_ber_margin: float = 5e-4
     stage1_zero_cfo_ber_scale: float = 2.0
+    terminal_progress_enabled: bool = True
     operator_eval_cfo: np.ndarray = field(default_factory=lambda: np.linspace(-0.20, 0.20, 41))
     ber_eval_cfo: np.ndarray = field(default_factory=lambda: np.linspace(-0.20, 0.20, 41))
     snr_sweep_ebn0_db_grid: np.ndarray = field(default_factory=lambda: np.arange(0.0, 22.0, 2.0))
@@ -109,7 +111,10 @@ class ExperimentConfig:
     stage2_local_kernel_size: int = 5
     stage2_use_confidence_features: bool = True
     stage2_use_symbol_correction_head: bool = True
-    stage2_loss_mse_weight: float = 0.01
+    stage2_use_residual_logit_head: bool = False
+    stage2_decision_loss: str = "SYMBOL_CE"
+    stage2_detector_only_logs_operator_terms: bool = True
+    stage2_loss_mse_weight: float = 0.25
     stage2_cfo_loss_weight: float = 0.10
     stage2_hard_cfo_loss_weight: float = 1.0
     stage2_noninferiority_weight: float = 0.25
@@ -162,6 +167,9 @@ class ExperimentConfig:
         self.stage2_detector_arch = self.stage2_detector_arch.upper()
         if self.stage2_detector_arch not in SUPPORTED_STAGE2_DETECTORS:
             raise ValueError(f"Unsupported stage2_detector_arch: {self.stage2_detector_arch}")
+        self.stage2_decision_loss = self.stage2_decision_loss.upper()
+        if self.stage2_decision_loss not in SUPPORTED_STAGE2_DECISION_LOSSES:
+            raise ValueError(f"Unsupported stage2_decision_loss: {self.stage2_decision_loss}")
         self.learned_init_pattern = normalize_tone_pattern(self.learned_init_pattern)
         if self.train_cfo_grid_points < 0:
             raise ValueError("train_cfo_grid_points cannot be negative.")
@@ -398,6 +406,11 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def log_terminal_progress(config: ExperimentConfig, message: str) -> None:
+    if bool(getattr(config, "terminal_progress_enabled", True)):
+        print(message, flush=True)
+
+
 def normalize_columns(basis: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     norms = torch.linalg.vector_norm(basis, dim=0, keepdim=True).clamp_min(eps)
     return basis / norms
@@ -620,6 +633,7 @@ def stage2_checkpoint_preflight(
         raise ValueError("Stage 2 requires checkpoint acceptance metadata.")
     if not bool(acceptance.get("passed", False)):
         raise ValueError(f"Stage 1 checkpoint did not pass acceptance: {acceptance.get('stop_reason', 'unknown')}")
+    checkpoint_config = checkpoint.get("config", {})
 
     learned_tx = checkpoint["learned_tx"].to(config.device)
     learned_rx = checkpoint["learned_rx"].to(config.device)
@@ -639,17 +653,23 @@ def stage2_checkpoint_preflight(
             f"Stage 1 checkpoint clean-leakage mismatch: expected={expected_leakage:.12e}, got={clean_leakage:.12e}."
         )
 
-    ofdm_tx, ofdm_rx = make_ofdm_baseline_transceiver(config)
+    preflight_config = replace(
+        config,
+        eval_ebn0_db=float(checkpoint_config.get("eval_ebn0_db", config.eval_ebn0_db)),
+        ber_blocks=int(checkpoint_config.get("ber_blocks", config.ber_blocks)),
+        ber_batch_size=int(checkpoint_config.get("ber_batch_size", config.ber_batch_size)),
+    )
+    ofdm_tx, ofdm_rx = make_ofdm_baseline_transceiver(preflight_config)
     eval_df = evaluate_scheme_set(
-        config=config,
+        config=preflight_config,
         schemes={
             "OFDM": EvaluationScheme(tx_basis=ofdm_tx, rx_basis=ofdm_rx, nonlinear_receiver=None),
             "Learned": EvaluationScheme(tx_basis=learned_tx, rx_basis=learned_rx, nonlinear_receiver=None),
         },
         cfo_points=np.array([0.0], dtype=float),
-        ebn0_db=config.eval_ebn0_db,
-        num_blocks=config.ber_blocks,
-        batch_size=config.ber_batch_size,
+        ebn0_db=preflight_config.eval_ebn0_db,
+        num_blocks=preflight_config.ber_blocks,
+        batch_size=preflight_config.ber_batch_size,
     )
     learned_ber_at_0 = float(eval_df[eval_df["method"] == "Learned"]["ber"].iloc[0])
     ofdm_ber_at_0 = float(eval_df[eval_df["method"] == "OFDM"]["ber"].iloc[0])
@@ -731,6 +751,7 @@ def run_full_experiment(
         tx_init=tx_init,
         rx_init=rx_init,
     )
+    log_terminal_progress(config, "[Stage1] Training finished; starting final evaluation")
     result = run_final_evaluation(config, training_result)
     stage1_acceptance_summary = build_stage1_acceptance_summary(config, training_result, result.summary_df)
     if not stage1_acceptance_summary["passed"]:
@@ -775,6 +796,7 @@ def run_stage2_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_source_path = Path(config.stage2_checkpoint_path)
+    log_terminal_progress(config, f"[Stage2] Loading Stage 1 checkpoint -> {checkpoint_source_path}")
     checkpoint = load_stage1_checkpoint(checkpoint_source_path, device=config.device, require_v2=True)
     checkpoint_config = checkpoint.get("config", {})
     if checkpoint_config:
@@ -785,8 +807,10 @@ def run_stage2_experiment(config: ExperimentConfig) -> ExperimentResult:
                 raise ValueError(
                     f"Stage 1 checkpoint mismatch for {field_name}: saved={saved_value!r}, current={current_value!r}."
                 )
+    log_terminal_progress(config, "[Stage2] Running checkpoint preflight")
     preflight = stage2_checkpoint_preflight(config, checkpoint)
     checkpoint_snapshot_path = snapshot_stage1_checkpoint(checkpoint_source_path, config.output_dir)
+    log_terminal_progress(config, f"[Stage2] Snapshot checkpoint -> {checkpoint_snapshot_path}")
     config.stage2_checkpoint_source_path = checkpoint_source_path
     config.stage2_checkpoint_snapshot_path = checkpoint_snapshot_path
     config.stage2_checkpoint_hash_sha256 = str(preflight["checkpoint_payload_hash_sha256"])

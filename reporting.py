@@ -45,6 +45,19 @@ METHOD_COLORS = {
 }
 
 
+def _progress_enabled(config: ExperimentConfig) -> bool:
+    return bool(getattr(config, "terminal_progress_enabled", True))
+
+
+def _log_progress(config: ExperimentConfig, message: str) -> None:
+    if _progress_enabled(config):
+        print(message, flush=True)
+
+
+def _stage2_decision_loss_label(config: ExperimentConfig) -> str:
+    return r"$L_{\mathrm{BCE}}$" if config.stage2_decision_loss == "BIT_BCE" else r"$L_{\mathrm{CE}}$"
+
+
 def method_display_name(method: str) -> str:
     return METHOD_DISPLAY_NAMES.get(method, method)
 
@@ -1204,7 +1217,7 @@ def plot_training_diagnostics(config: ExperimentConfig, history_df: pd.DataFrame
         plt.close(fig)
         return path
 
-    if config.stage2_enabled and "val_ber" in history_df.columns and "train_Lce" in history_df.columns:
+    if config.stage2_enabled and "val_ber" in history_df.columns and "train_Ldecision" in history_df.columns:
         fig, axes = plt.subplots(2, 2, figsize=(11, 7), dpi=130, constrained_layout=True)
         axes = axes.ravel()
 
@@ -1303,7 +1316,7 @@ def plot_training_loss_components(config: ExperimentConfig, history_df: pd.DataF
         plt.close(fig)
         return path
 
-    if config.stage2_enabled and "train_Lce" in history_df.columns:
+    if config.stage2_enabled and "train_Ldecision" in history_df.columns:
         fig, axes = plt.subplots(2, 1, figsize=(11, 7), dpi=130, constrained_layout=True, sharex=True)
 
         for stage, group in history_df.groupby("stage"):
@@ -1315,6 +1328,8 @@ def plot_training_loss_components(config: ExperimentConfig, history_df: pd.DataF
         axes[0].legend()
 
         component_specs = [
+            ("train_Ldecision", _stage2_decision_loss_label(config)),
+            ("train_Lbce", r"$L_{\mathrm{BCE}}$"),
             ("train_Lce", r"$L_{\mathrm{CE}}$"),
             ("train_Lmse", r"$L_{\mathrm{MSE}}$"),
             ("train_L0", r"$L_0$"),
@@ -1824,10 +1839,11 @@ def build_mapping_markdown(config: ExperimentConfig) -> str:
                 rf"$z_0 = V y,\quad (\hat{{s}}, \ell) = R_\theta(z_0)$",
                 "",
                 "- The Stage 1 linear receiver remains the interpretable front-end.",
-                "- The nonlinear receiver is a CFO-conditioned two-pass local symbol-domain detector with geometry-anchored `16QAM` logits, tentative-decision cancellation, and an optional weak symbol-correction head.",
+                "- The nonlinear receiver is a CFO-conditioned residual symbol-domain corrector: it refines `z_0`, optionally uses tentative-decision cancellation, and decodes through geometry-anchored `16QAM` logits.",
                 "- `nonlinear_only` freezes `W` and `V` and trains only `R_theta`.",
                 "- `joint` first trains `R_theta` with frozen `W,V`, then optionally reopens `V` while keeping `W` fixed.",
-                "- BER is decoded from the nonlinear logits head, while EVM continues to use corrected complex-symbol estimates.",
+                "- The direct residual-logit bypass is disabled by default so Stage 2 improves BER by improving corrected symbols.",
+                "- BER is decoded from geometry-derived bit logits thresholded at zero, while EVM continues to use corrected complex-symbol estimates.",
             ]
         )
     if config.payload_region_enabled:
@@ -1895,11 +1911,20 @@ def build_summary_markdown(
             f"format `{config.stage2_checkpoint_format}`, payload hash `{config.stage2_checkpoint_hash_sha256}`, "
             f"file hash `{config.stage2_checkpoint_file_sha256}`, acceptance `{config.stage2_checkpoint_acceptance_passed}`."
         )
+        if not stage_summary_df.empty and "identity_bit_mismatch_rate_vs_stage1" in stage_summary_df.columns:
+            identity_row = stage_summary_df.iloc[0]
+            lines.append(
+                f"- Stage 2 identity diagnostic: symbol-MSE-to-`z0` `{identity_row['identity_symbol_mse_to_z0']:.4e}`, "
+                f"max-logit diff `{identity_row['identity_max_logit_abs_diff']:.4e}`, "
+                f"max-bit-logit diff `{identity_row.get('identity_max_bit_logit_abs_diff', float('nan')):.4e}`, "
+                f"bit mismatch vs Stage 1 `{identity_row['identity_bit_mismatch_rate_vs_stage1']:.4e}`."
+            )
         for _, row in stage_summary_df.iterrows():
             if np.isfinite(row["val_total"]):
                 lines.append(
-                    f"- {row['stage']}: best epoch `{int(row['best_global_epoch'])}`, "
-                    f"val total `{row['val_total']:.4e}`, val BER `{row['val_ber']:.4e}`, hard-CFO weighted BER `{row['hard_cfo_weighted_ber']:.4e}`, residual scale `{row['residual_scale']:.4f}`, "
+                    f"- {row['stage']}: best stage epoch `{int(row.get('best_stage_epoch', row['best_global_epoch']))}`"
+                    f" (global `{int(row['best_global_epoch'])}`), "
+                    f"val total `{row['val_total']:.4e}`, val BER `{row['val_ber']:.4e}`, hard-CFO weighted BER `{row['hard_cfo_weighted_ber']:.4e}` vs Stage 1 `{row.get('baseline_hard_cfo_weighted_ber', float('nan')):.4e}`, residual scale `{row['residual_scale']:.4f}`, "
                     f"cancellation scale `{row.get('cancellation_scale', float('nan')):.4f}`, eps-hat MAE `{row.get('eps_hat_mae', float('nan')):.4e}`, "
                     f"clean identity `{row['clean_identity_loss']:.4e}`, clean leakage `{row['clean_offdiag_leakage']:.4e}`."
                 )
@@ -2089,7 +2114,9 @@ def run_final_evaluation(
 ) -> ExperimentResult:
     del method_order
     schemes = build_scheme_dict(config, training_result) if schemes is None else schemes
+    _log_progress(config, "[Eval] Building operator diagnostics")
     operator_df, diagonal_df = build_operator_df(config, schemes)
+    _log_progress(config, "[Eval] BER vs CFO sweep")
     ber_df = evaluate_scheme_set(
         config=config,
         schemes=schemes,
@@ -2097,13 +2124,18 @@ def run_final_evaluation(
         ebn0_db=config.eval_ebn0_db,
         num_blocks=config.ber_blocks,
         batch_size=config.ber_batch_size,
+        progress_label="BER vs CFO",
     )
     ber_df["method_label"] = ber_df["method"].map(method_display_name)
+    _log_progress(config, "[Eval] BER vs SNR slices")
     ber_snr_df = build_ber_snr_df(config, schemes)
+    _log_progress(config, "[Eval] Constellation snapshots")
     constellation_df = build_constellation_df(config, schemes)
+    _log_progress(config, "[Eval] Spectral and PAPR outputs")
     spectral_df, spectral_summary_df, papr_df, papr_summary_df = build_spectral_outputs(config, schemes)
     summary_df = build_summary_df(config, training_result, operator_df, ber_df)
     snr_summary_df = build_snr_summary_df(ber_snr_df)
+    _log_progress(config, "[Eval] Writing CSV artifacts")
     artifact_paths = save_artifacts(
         config,
         training_result,
@@ -2119,6 +2151,7 @@ def run_final_evaluation(
         summary_df,
         snr_summary_df,
     )
+    _log_progress(config, "[Eval] Rendering plots")
     artifact_paths["training_plot"] = plot_training_diagnostics(config, training_result.history_df)
     artifact_paths["training_loss_components_plot"] = plot_training_loss_components(config, training_result.history_df)
     operator_heatmap = plot_operator_heatmaps(config, schemes)
