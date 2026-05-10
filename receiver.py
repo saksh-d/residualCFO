@@ -35,6 +35,9 @@ class EvaluationScheme:
     oracle_pre_v_cfo: bool = False
     oracle_post_v_mmse: bool = False
     oracle_mmse_alpha: float | None = None
+    oracle_mmse_eps_scale: float | None = None
+    oracle_mmse_eps_noise_std_rel: float | None = None
+    oracle_mmse_eps_noise_seed_offset: int = 0
     oracle_eps_conditioning: bool = False
 
 
@@ -586,6 +589,10 @@ class CfoEstimatorMmseReceiver(nn.Module):
         kernel_size: int = 5,
         max_abs_eps: float = 0.1,
         alpha_scale: float = 1.0,
+        sideinfo_enabled: bool = False,
+        sideinfo_mode: str = "NONE",
+        sideinfo_scale: float = 0.0,
+        sideinfo_residual_enabled: bool = False,
     ) -> None:
         super().__init__()
         if num_symbols <= 0:
@@ -618,7 +625,20 @@ class CfoEstimatorMmseReceiver(nn.Module):
         self.feature_channels = 5
         self.max_abs_eps = float(max_abs_eps)
         self.alpha_scale = float(alpha_scale)
+        self.sideinfo_enabled = bool(sideinfo_enabled)
+        self.sideinfo_mode = str(sideinfo_mode).upper()
+        self.sideinfo_scale = float(sideinfo_scale)
+        self.sideinfo_residual_enabled = bool(sideinfo_residual_enabled)
         self.blend_param = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+        if self.sideinfo_mode not in {"NONE", "SCALED_TRUE"}:
+            raise ValueError(f"Unsupported Stage 2 side-information mode: {self.sideinfo_mode}")
+        if not self.sideinfo_enabled:
+            self.sideinfo_mode = "NONE"
+            self.sideinfo_scale = 0.0
+            self.sideinfo_residual_enabled = False
+        if self.sideinfo_residual_enabled and self.sideinfo_mode == "NONE":
+            raise ValueError("Stage 2 residual-on-coarse requires a concrete side-information mode.")
 
         if self.architecture == "DENSE":
             feature_dim = self.feature_channels * self.num_symbols
@@ -632,10 +652,23 @@ class CfoEstimatorMmseReceiver(nn.Module):
             )
             nn.init.zeros_(self.dense_head[-1].weight)
             nn.init.zeros_(self.dense_head[-1].bias)
+            if self.sideinfo_residual_enabled:
+                self.dense_sideinfo_head = nn.Sequential(
+                    nn.Linear(feature_dim + 1, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, 1),
+                )
+                nn.init.zeros_(self.dense_sideinfo_head[-1].weight)
+                nn.init.zeros_(self.dense_sideinfo_head[-1].bias)
+            else:
+                self.dense_sideinfo_head = None
             self.conv1 = None
             self.conv2 = None
             self.conv3 = None
             self.pool_head = None
+            self.pool_sideinfo_head = None
         else:
             padding = kernel_size // 2
             self.conv1 = nn.Conv1d(self.feature_channels, self.channels, kernel_size=kernel_size, padding=padding)
@@ -648,7 +681,18 @@ class CfoEstimatorMmseReceiver(nn.Module):
             )
             nn.init.zeros_(self.pool_head[-1].weight)
             nn.init.zeros_(self.pool_head[-1].bias)
+            if self.sideinfo_residual_enabled:
+                self.pool_sideinfo_head = nn.Sequential(
+                    nn.Linear(self.channels + 1, self.channels),
+                    nn.GELU(),
+                    nn.Linear(self.channels, 1),
+                )
+                nn.init.zeros_(self.pool_sideinfo_head[-1].weight)
+                nn.init.zeros_(self.pool_sideinfo_head[-1].bias)
+            else:
+                self.pool_sideinfo_head = None
             self.dense_head = None
+            self.dense_sideinfo_head = None
 
     def tx_basis(self) -> torch.Tensor:
         return self.tx_basis_buffer
@@ -662,6 +706,16 @@ class CfoEstimatorMmseReceiver(nn.Module):
     def cancellation_scale(self) -> torch.Tensor:
         return torch.zeros((), device=self.blend_param.device, dtype=torch.float32)
 
+    def _coarse_eps_from_true(self, eps_true: torch.Tensor) -> torch.Tensor:
+        eps_true = eps_true.to(torch.float32)
+        if self.sideinfo_mode == "NONE":
+            raise ValueError("Stage 2 coarse CFO requested without an enabled side-information mode.")
+        if self.sideinfo_mode == "SCALED_TRUE":
+            coarse = self.sideinfo_scale * eps_true
+        else:
+            raise ValueError(f"Unsupported Stage 2 side-information mode: {self.sideinfo_mode}")
+        return torch.clamp(coarse, min=-self.max_abs_eps, max=self.max_abs_eps)
+
     def _estimate_eps(self, z0: torch.Tensor) -> torch.Tensor:
         features = _complex_phase_features(z0)
         if self.architecture == "DENSE":
@@ -674,6 +728,25 @@ class CfoEstimatorMmseReceiver(nn.Module):
         hidden = F.gelu(self.conv3(hidden))
         pooled = torch.mean(hidden, dim=-1)
         return torch.tanh(self.pool_head(pooled).squeeze(-1)) * self.max_abs_eps
+
+    def _estimate_eps_from_coarse(self, z0: torch.Tensor, eps_coarse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        eps_coarse = eps_coarse.to(device=z0.device, dtype=torch.float32)
+        features = _complex_phase_features(z0)
+        if self.architecture == "DENSE":
+            assert self.dense_sideinfo_head is not None
+            flat = torch.flatten(features, start_dim=1)
+            sideinfo_input = torch.cat([flat, eps_coarse.unsqueeze(-1)], dim=-1)
+            residual = torch.tanh(self.dense_sideinfo_head(sideinfo_input).squeeze(-1)) * self.max_abs_eps
+        else:
+            assert self.conv1 is not None and self.conv2 is not None and self.conv3 is not None and self.pool_sideinfo_head is not None
+            hidden = F.gelu(self.conv1(features))
+            hidden = F.gelu(self.conv2(hidden))
+            hidden = F.gelu(self.conv3(hidden))
+            pooled = torch.mean(hidden, dim=-1)
+            sideinfo_input = torch.cat([pooled, eps_coarse.unsqueeze(-1)], dim=-1)
+            residual = torch.tanh(self.pool_sideinfo_head(sideinfo_input).squeeze(-1)) * self.max_abs_eps
+        eps_hat = torch.clamp(eps_coarse + residual, min=-self.max_abs_eps, max=self.max_abs_eps)
+        return eps_hat, residual
 
     def _alpha_values(self, ebn0_db_values: float | torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:
         if isinstance(ebn0_db_values, torch.Tensor):
@@ -707,21 +780,43 @@ class CfoEstimatorMmseReceiver(nn.Module):
         z0: torch.Tensor,
         ebn0_db_values: float | torch.Tensor,
         eps_override: torch.Tensor | None = None,
+        eps_true: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        eps_coarse = None
+        eps_residual = None
         if eps_override is None:
-            eps_hat = self._estimate_eps(z0)
+            if self.sideinfo_enabled:
+                if eps_true is None:
+                    raise ValueError("Side-information-conditioned Stage 2 requires the true CFO tensor to build the coarse seed.")
+                eps_coarse = self._coarse_eps_from_true(eps_true)
+                if self.sideinfo_residual_enabled:
+                    eps_hat, eps_residual = self._estimate_eps_from_coarse(z0, eps_coarse)
+                else:
+                    eps_hat = eps_coarse
+                    eps_residual = torch.zeros_like(eps_hat)
+            else:
+                eps_hat = self._estimate_eps(z0)
         else:
             eps_hat = eps_override.to(device=z0.device, dtype=torch.float32)
         solved_symbols = self._mmse_solve(z0, eps_hat, ebn0_db_values)
-        blend = self.residual_scale().to(z0.dtype)
-        corrected_symbols = z0 + blend * (solved_symbols - z0)
+        if self.sideinfo_enabled:
+            corrected_symbols = solved_symbols
+            solver_blend = torch.ones((), device=z0.device, dtype=torch.float32)
+        else:
+            blend = self.residual_scale().to(z0.dtype)
+            corrected_symbols = z0 + blend * (solved_symbols - z0)
+            solver_blend = self.residual_scale().to(torch.float32)
         logits = stage1_geometry_logits(corrected_symbols)
         aux = {
             "eps_hat": eps_hat.to(torch.float32),
             "bit_logits": qam16_symbol_logits_to_bit_logits(logits),
             "cancellation_scale": self.cancellation_scale().to(torch.float32),
-            "solver_blend": self.residual_scale().to(torch.float32),
+            "solver_blend": solver_blend,
         }
+        if eps_coarse is not None:
+            aux["eps_coarse"] = eps_coarse.to(torch.float32)
+        if eps_residual is not None:
+            aux["eps_residual"] = eps_residual.to(torch.float32)
         return corrected_symbols, logits, aux
 
 
@@ -760,6 +855,7 @@ class JointStage2Model(nn.Module):
             z0,
             ebn0_db_values=ebn0_db_values,
             eps_override=oracle_eps_override,
+            eps_true=eps_values,
         )
         return corrected_symbols, logits, z0, aux
 
@@ -1015,10 +1111,16 @@ def _require_stage2_supported_config(config: ExperimentConfig) -> None:
         raise ValueError("Stage 2 nonlinear receiver support is currently limited to the structured K-bin setup.")
 
 
-def _stage2_max_abs_cfo(config: ExperimentConfig) -> float:
+def _stage2_training_abs_cfo_scale(config: ExperimentConfig) -> float:
     support_max = max((abs(value) for value in config.train_cfo_support), default=0.0)
+    return max(float(config.stage_c_cfo), float(support_max), 1e-3)
+
+
+def _stage2_estimator_max_abs_cfo(config: ExperimentConfig) -> float:
+    if config.stage2_estimator_max_abs_cfo is not None:
+        return float(config.stage2_estimator_max_abs_cfo)
     select_max = max((abs(value) for value in config.stage2_selection_abs_cfo_points), default=0.0)
-    return max(float(config.stage_c_cfo), float(support_max), float(select_max), 1e-3)
+    return max(_stage2_training_abs_cfo_scale(config), float(select_max), 1e-3)
 
 
 def _stage2_dual_head_loss(
@@ -1052,7 +1154,7 @@ def _stage2_dual_head_loss(
     if eps_hat is None or eps_true is None:
         loss_eps = torch.zeros((), device=logits.device, dtype=torch.float32)
     else:
-        eps_scale = _stage2_max_abs_cfo(config)
+        eps_scale = _stage2_training_abs_cfo_scale(config)
         loss_eps = torch.mean(((eps_hat - eps_true.to(torch.float32)) / eps_scale) ** 2)
     total = loss_decision + config.stage2_loss_mse_weight * loss_mse + config.stage2_cfo_loss_weight * loss_eps
     return total, {
@@ -1065,16 +1167,18 @@ def _stage2_dual_head_loss(
     }
 
 
-def _stage2_symbol_error_rate(logits: torch.Tensor, bits: torch.Tensor) -> torch.Tensor:
-    bit_logits = qam16_symbol_logits_to_bit_logits(logits)
-    bits_hat = (bit_logits >= 0.0).to(torch.int64)
+def _bits_from_complex_symbols(symbols: torch.Tensor, modulation: str) -> torch.Tensor:
+    bits_hat, _ = slice_symbols(symbols, modulation)
+    return bits_hat
+
+
+def _stage2_symbol_error_rate(symbols: torch.Tensor, bits: torch.Tensor, modulation: str) -> torch.Tensor:
+    bits_hat = _bits_from_complex_symbols(symbols, modulation)
     return torch.mean(torch.any(bits_hat != bits, dim=-1).to(torch.float32))
 
 
-def _stage2_bits_from_outputs(logits: torch.Tensor, aux: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
-    if aux is not None and "bit_logits" in aux:
-        return (aux["bit_logits"] >= 0.0).to(torch.int64)
-    return (qam16_symbol_logits_to_bit_logits(logits) >= 0.0).to(torch.int64)
+def _stage2_bits_from_outputs(symbols: torch.Tensor, modulation: str) -> torch.Tensor:
+    return _bits_from_complex_symbols(symbols, modulation)
 
 
 def _stage2_hard_cfo_weighted_ber(
@@ -1093,10 +1197,10 @@ def _stage2_hard_cfo_weighted_ber(
         eps_neg = torch.full((symbols.shape[0],), -float(abs_eps), device=config.device, dtype=torch.float32)
         oracle_eps_pos = eps_pos if oracle_eps_conditioning else None
         oracle_eps_neg = eps_neg if oracle_eps_conditioning else None
-        _, logits_pos, _, aux_pos = model(symbols, eps_pos, config, ebn0_db_values, oracle_eps_override=oracle_eps_pos)
-        _, logits_neg, _, aux_neg = model(symbols, eps_neg, config, ebn0_db_values, oracle_eps_override=oracle_eps_neg)
-        ber_pos = torch.mean((_stage2_bits_from_outputs(logits_pos, aux_pos) != bits).to(torch.float32))
-        ber_neg = torch.mean((_stage2_bits_from_outputs(logits_neg, aux_neg) != bits).to(torch.float32))
+        corrected_pos, _, _, _ = model(symbols, eps_pos, config, ebn0_db_values, oracle_eps_override=oracle_eps_pos)
+        corrected_neg, _, _, _ = model(symbols, eps_neg, config, ebn0_db_values, oracle_eps_override=oracle_eps_neg)
+        ber_pos = torch.mean((_stage2_bits_from_outputs(corrected_pos, config.modulation) != bits).to(torch.float32))
+        ber_neg = torch.mean((_stage2_bits_from_outputs(corrected_neg, config.modulation) != bits).to(torch.float32))
         total = total + weight * 0.5 * (ber_pos + ber_neg)
     return total
 
@@ -1287,8 +1391,7 @@ def _stage1_hard_cfo_weighted_ber_for_basis(
             tx_signal = transmit_symbols(symbols, tx_basis)
             rx_signal, _ = propagate(tx_signal, eps_values, config, ebn0_db=ebn0_db_values)
             z0 = decode_symbols(rx_signal, rx_basis)
-            logits = stage1_geometry_logits(z0)
-            ber = torch.mean((qam16_bits_from_labels(torch.argmax(logits, dim=-1)) != bits).to(torch.float32))
+            ber = torch.mean((_bits_from_complex_symbols(z0, config.modulation) != bits).to(torch.float32))
             total = total + 0.5 * weight * ber
     return float(total.item())
 
@@ -1304,11 +1407,26 @@ def _stage2_identity_diagnostic(
     ebn0_values = _sample_training_ebn0_values(config, batch_size, deterministic=True)
     with torch.no_grad():
         corrected_symbols, logits, z0, aux = model(symbols, eps_values, config, ebn0_values)
+        if config.stage2_sideinfo_enabled:
+            reference_eps = model.nonlinear_receiver._coarse_eps_from_true(eps_values)
+            reference_symbols = model.nonlinear_receiver._mmse_solve(z0, reference_eps, ebn0_values)
+            eps_hat = aux.get("eps_hat", torch.zeros_like(reference_eps))
+            return {
+                "identity_symbol_mse_to_z0": float(normalized_symbol_mse(corrected_symbols, z0).item()),
+                "identity_max_symbol_abs_diff": float(torch.max(torch.abs(corrected_symbols - reference_symbols)).item()),
+                "identity_max_logit_abs_diff": 0.0,
+                "identity_max_bit_logit_abs_diff": 0.0,
+                "identity_bit_mismatch_rate_vs_stage1": float("nan"),
+                "identity_label_mismatch_rate_vs_stage1": float("nan"),
+                "identity_reference_ber_vs_stage1_bits": float(torch.mean((_bits_from_complex_symbols(z0, config.modulation) != bits).to(torch.float32)).item()),
+                "sideinfo_init_eps_mae_to_reference": float(torch.mean(torch.abs(eps_hat - reference_eps)).item()),
+                "sideinfo_init_reference_symbol_mse": float(normalized_symbol_mse(reference_symbols, corrected_symbols).item()),
+            }
         stage1_logits = stage1_geometry_logits(z0)
         stage1_bit_logits = qam16_symbol_logits_to_bit_logits(stage1_logits)
-        stage1_bits = (stage1_bit_logits >= 0.0).to(torch.int64)
+        stage1_bits = _bits_from_complex_symbols(z0, config.modulation)
         stage2_bit_logits = aux.get("bit_logits", qam16_symbol_logits_to_bit_logits(logits))
-        stage2_bits = (stage2_bit_logits >= 0.0).to(torch.int64)
+        stage2_bits = _bits_from_complex_symbols(corrected_symbols, config.modulation)
     return {
         "identity_symbol_mse_to_z0": float(normalized_symbol_mse(corrected_symbols, z0).item()),
         "identity_max_symbol_abs_diff": float(torch.max(torch.abs(corrected_symbols - z0)).item()),
@@ -1454,9 +1572,9 @@ def _run_stage2_training_stage(
                 optimize_operator_terms=optimize_operator_terms,
                 oracle_eps_conditioning=oracle_eps_conditioning,
             )
-            val_bits_hat = _stage2_bits_from_outputs(logits_val, aux_val)
+            val_bits_hat = _stage2_bits_from_outputs(corrected_val, config.modulation)
             val_ber = torch.mean((val_bits_hat != val_bits).to(torch.float32)).item()
-            val_ser = _stage2_symbol_error_rate(logits_val, val_bits).item()
+            val_ser = _stage2_symbol_error_rate(corrected_val, val_bits, config.modulation).item()
             row = {
                 "scheme": scheme_name,
                 "stage": stage.name,
@@ -1509,7 +1627,9 @@ def _run_stage2_training_stage(
                     oracle_eps_conditioning=oracle_eps_conditioning,
                 ).item(),
                 "baseline_hard_cfo_weighted_ber": val_stage1_hard_ber,
-                "residual_scale": model.nonlinear_receiver.residual_scale().item(),
+                "residual_scale": float(
+                    aux_val.get("solver_blend", model.nonlinear_receiver.residual_scale().to(torch.float32)).mean().item()
+                ),
                 "cancellation_scale": float(aux_val.get("cancellation_scale", torch.zeros((), device=config.device)).item()),
                 "eps_hat_mae": float(
                     torch.mean(torch.abs(aux_val.get("eps_hat", torch.zeros_like(val_eps)) - val_eps.to(torch.float32))).item()
@@ -1598,8 +1718,8 @@ def _run_stage2_training_stage(
             "val_LV": float(val_components["LV"].item()),
             "val_Lnn": float(val_components["Lnn"].item()),
             "val_Lspec": float(val_components["Lspec"].item()),
-            "val_ber": float(torch.mean((_stage2_bits_from_outputs(logits_val, aux_val) != val_bits).to(torch.float32)).item()),
-            "val_ser": float(_stage2_symbol_error_rate(logits_val, val_bits).item()),
+            "val_ber": float(torch.mean((_stage2_bits_from_outputs(corrected_val, config.modulation) != val_bits).to(torch.float32)).item()),
+            "val_ser": float(_stage2_symbol_error_rate(corrected_val, val_bits, config.modulation).item()),
             "hard_cfo_weighted_ber": float(
                 _stage2_hard_cfo_weighted_ber(
                     config,
@@ -1611,7 +1731,9 @@ def _run_stage2_training_stage(
                 ).item()
             ),
             "baseline_hard_cfo_weighted_ber": float(val_stage1_hard_ber),
-            "residual_scale": float(model.nonlinear_receiver.residual_scale().item()),
+            "residual_scale": float(
+                aux_val.get("solver_blend", model.nonlinear_receiver.residual_scale().to(torch.float32)).mean().item()
+            ),
             "cancellation_scale": float(aux_val.get("cancellation_scale", torch.zeros((), device=config.device)).item()),
             "eps_hat_mae": float(
                 torch.mean(torch.abs(aux_val.get("eps_hat", torch.zeros_like(val_eps)) - val_eps.to(torch.float32))).item()
@@ -1664,7 +1786,11 @@ def train_stage2_nonlinear_receiver(
         channels=config.stage2_local_channels,
         hidden_multiplier=config.stage2_hidden_multiplier,
         kernel_size=config.stage2_local_kernel_size,
-        max_abs_eps=_stage2_max_abs_cfo(config),
+        max_abs_eps=_stage2_estimator_max_abs_cfo(config),
+        sideinfo_enabled=config.stage2_sideinfo_enabled,
+        sideinfo_mode=config.stage2_sideinfo_mode,
+        sideinfo_scale=config.stage2_sideinfo_scale,
+        sideinfo_residual_enabled=config.stage2_sideinfo_residual_enabled,
     ).to(config.device)
     model = JointStage2Model(
         tx_init=tx_init,
@@ -1676,23 +1802,40 @@ def train_stage2_nonlinear_receiver(
     stage_rows: list[dict[str, float | int | str | bool | None]] = []
     global_epoch = 0
     identity_diag = _stage2_identity_diagnostic(config, model, batch_size=min(config.train_symbol_batch_size, 128))
-    if (
-        identity_diag["identity_bit_mismatch_rate_vs_stage1"] > 0.0
-        or identity_diag["identity_label_mismatch_rate_vs_stage1"] > 0.0
-        or identity_diag["identity_max_symbol_abs_diff"] > 1e-7
-        or identity_diag["identity_max_logit_abs_diff"] > 1e-7
-        or identity_diag["identity_max_bit_logit_abs_diff"] > 1e-7
-    ):
-        raise ValueError(f"Stage 2 identity initialization check failed: {identity_diag}")
-    _log_progress(
-        config,
-        (
-            f"[Stage2] Identity diagnostic | symbol_mse={identity_diag['identity_symbol_mse_to_z0']:.4e} "
-            f"bit_mismatch={identity_diag['identity_bit_mismatch_rate_vs_stage1']:.4e} "
-            f"logit_diff={identity_diag['identity_max_logit_abs_diff']:.4e} "
-            f"bit_logit_diff={identity_diag['identity_max_bit_logit_abs_diff']:.4e}"
-        ),
-    )
+    if config.stage2_sideinfo_enabled:
+        if (
+            identity_diag["identity_max_symbol_abs_diff"] > 1e-7
+            or identity_diag.get("sideinfo_init_eps_mae_to_reference", 0.0) > 1e-7
+            or identity_diag.get("sideinfo_init_reference_symbol_mse", 0.0) > 1e-7
+        ):
+            raise ValueError(f"Stage 2 side-information initialization check failed: {identity_diag}")
+        _log_progress(
+            config,
+            (
+                f"[Stage2] Side-info init diagnostic | coarse_mode={config.stage2_sideinfo_mode} "
+                f"scale={config.stage2_sideinfo_scale:.3f} "
+                f"| ref_symbol_mse={identity_diag['sideinfo_init_reference_symbol_mse']:.4e} "
+                f"eps_mae={identity_diag['sideinfo_init_eps_mae_to_reference']:.4e}"
+            ),
+        )
+    else:
+        if (
+            identity_diag["identity_bit_mismatch_rate_vs_stage1"] > 0.0
+            or identity_diag["identity_label_mismatch_rate_vs_stage1"] > 0.0
+            or identity_diag["identity_max_symbol_abs_diff"] > 1e-7
+            or identity_diag["identity_max_logit_abs_diff"] > 1e-7
+            or identity_diag["identity_max_bit_logit_abs_diff"] > 1e-7
+        ):
+            raise ValueError(f"Stage 2 identity initialization check failed: {identity_diag}")
+        _log_progress(
+            config,
+            (
+                f"[Stage2] Identity diagnostic | symbol_mse={identity_diag['identity_symbol_mse_to_z0']:.4e} "
+                f"bit_mismatch={identity_diag['identity_bit_mismatch_rate_vs_stage1']:.4e} "
+                f"logit_diff={identity_diag['identity_max_logit_abs_diff']:.4e} "
+                f"bit_logit_diff={identity_diag['identity_max_bit_logit_abs_diff']:.4e}"
+            ),
+        )
     _, stage_row, global_epoch = _run_stage2_training_stage(
         config=config,
         model=model,
@@ -1727,6 +1870,7 @@ def detect_scheme_symbols(
     rx_signal: torch.Tensor,
     eps_tensor: torch.Tensor | None = None,
     ebn0_db: float | torch.Tensor | None = None,
+    eval_seed: int | None = None,
 ) -> dict[str, torch.Tensor | float]:
     rx_basis = scheme.rx_basis
     pilot_symbol_mse = float("nan")
@@ -1765,7 +1909,30 @@ def detect_scheme_symbols(
                 alpha = float(torch.mean(1.0 / (config.bits_per_symbol * torch.pow(10.0, ebn0_db.to(torch.float32) / 10.0))).item())
             else:
                 alpha = ebn0_to_noise_variance(float(ebn0_db), config.bits_per_symbol)
-        corrected_symbols = oracle_symbol_mmse_equalize(z0, scheme.tx_basis, scheme.rx_basis, eps_tensor, alpha)
+        eps_for_mmse = eps_tensor
+        if scheme.oracle_mmse_eps_scale is not None:
+            eps_for_mmse = scheme.oracle_mmse_eps_scale * eps_tensor
+        if scheme.oracle_mmse_eps_noise_std_rel is not None:
+            noise_std_rel = float(scheme.oracle_mmse_eps_noise_std_rel)
+            if noise_std_rel < 0.0:
+                raise ValueError("oracle_mmse_eps_noise_std_rel must be non-negative.")
+            if noise_std_rel > 0.0:
+                noise_std = noise_std_rel * torch.abs(eps_tensor.to(torch.float32))
+                if eval_seed is not None:
+                    generator_device = eps_tensor.device if eps_tensor.is_cuda else torch.device("cpu")
+                    generator = torch.Generator(device=generator_device)
+                    generator.manual_seed(int(eval_seed) + int(scheme.oracle_mmse_eps_noise_seed_offset))
+                    eps_noise = torch.randn(
+                        eps_tensor.shape,
+                        generator=generator,
+                        device=eps_tensor.device,
+                        dtype=torch.float32,
+                    )
+                else:
+                    eps_noise = torch.randn(eps_tensor.shape, device=eps_tensor.device, dtype=torch.float32)
+                eps_for_mmse = eps_for_mmse.to(torch.float32) + noise_std * eps_noise
+                eps_for_mmse = eps_for_mmse.to(eps_tensor.dtype)
+        corrected_symbols = oracle_symbol_mmse_equalize(z0, scheme.tx_basis, scheme.rx_basis, eps_for_mmse, alpha)
         aux = {}
         bits_hat_full, _ = slice_symbols(corrected_symbols, config.modulation)
     elif scheme.nonlinear_receiver is not None:
@@ -1776,10 +1943,11 @@ def detect_scheme_symbols(
             z0,
             ebn0_db_values=ebn0_db,
             eps_override=oracle_eps,
+            eps_true=eps_tensor,
         )
         if config.modulation != "16QAM":
             raise ValueError("Nonlinear receiver inference is currently implemented only for 16QAM.")
-        bits_hat_full = _stage2_bits_from_outputs(logits, aux)
+        bits_hat_full = _stage2_bits_from_outputs(corrected_symbols, config.modulation)
         if eps_tensor is not None and "eps_hat" in aux:
             eps_error = aux["eps_hat"].to(torch.float32) - eps_tensor.to(torch.float32)
             stage2_eps_hat_mae = float(torch.mean(torch.abs(eps_error)).item())
@@ -1820,11 +1988,19 @@ def evaluate_single(
     bits: torch.Tensor,
     symbols: torch.Tensor,
     noise: torch.Tensor,
+    eval_seed: int | None = None,
 ) -> dict[str, float]:
     eps_tensor = torch.full((symbols.shape[0],), float(eps), device=symbols.device, dtype=torch.float32)
     tx_signal = transmit_symbols(symbols, scheme.tx_basis)
     rx_signal, _ = propagate(tx_signal, eps_tensor, config, ebn0_db=ebn0_db, noise=noise)
-    outputs = detect_scheme_symbols(config, scheme, rx_signal, eps_tensor=eps_tensor, ebn0_db=ebn0_db)
+    outputs = detect_scheme_symbols(
+        config,
+        scheme,
+        rx_signal,
+        eps_tensor=eps_tensor,
+        ebn0_db=ebn0_db,
+        eval_seed=eval_seed,
+    )
     shat_data = outputs["symbol_estimates"]
     bits_hat = outputs["bits_hat"]
 
@@ -1915,6 +2091,7 @@ def evaluate_scheme_set(
                 torch.randn(bsz, config.M, device=config.device)
                 + 1j * torch.randn(bsz, config.M, device=config.device)
             ).to(torch.complex64)
+            batch_eval_seed = seed + 1_000_000 * eps_idx + processed
             for name, scheme in schemes.items():
                 metrics = evaluate_single(
                     config=config,
@@ -1924,6 +2101,7 @@ def evaluate_scheme_set(
                     bits=bits,
                     symbols=symbols,
                     noise=noise,
+                    eval_seed=batch_eval_seed,
                 )
                 accum[name]["bit_errors"] += metrics["bit_errors"]
                 accum[name]["bit_total"] += metrics["bit_total"]

@@ -18,6 +18,7 @@ SUPPORTED_TONE_PATTERNS = ("CONTIGUOUS", "SPREAD")
 SUPPORTED_STAGE2_WORKFLOWS = ("NONLINEAR_ONLY",)
 SUPPORTED_STAGE2_DETECTORS = ("DENSE", "LOCAL")
 SUPPORTED_STAGE2_DECISION_LOSSES = ("SYMBOL_CE", "BIT_BCE")
+SUPPORTED_STAGE2_SIDEINFO_MODES = ("NONE", "SCALED_TRUE")
 
 
 def modulation_bits_per_symbol(modulation: str) -> int:
@@ -134,6 +135,11 @@ class ExperimentConfig:
     stage2_checkpoint_ofdm_ber_at_0: float | None = None
     stage2_nonlinear_only_epochs: int = 200
     stage2_nonlinear_only_learning_rate: float = 1.0e-3
+    stage2_estimator_max_abs_cfo: float | None = None
+    stage2_sideinfo_enabled: bool = False
+    stage2_sideinfo_mode: str = "NONE"
+    stage2_sideinfo_scale: float = 0.0
+    stage2_sideinfo_residual_enabled: bool = False
     stage2_selection_abs_cfo_points: tuple[float, ...] = (0.05, 0.10)
     stage2_selection_abs_cfo_weights: tuple[float, ...] = (0.35, 0.65)
     # basis_plot_indices: tuple[int, ...] | None = None
@@ -163,6 +169,9 @@ class ExperimentConfig:
         self.stage2_decision_loss = self.stage2_decision_loss.upper()
         if self.stage2_decision_loss not in SUPPORTED_STAGE2_DECISION_LOSSES:
             raise ValueError(f"Unsupported stage2_decision_loss: {self.stage2_decision_loss}")
+        self.stage2_sideinfo_mode = self.stage2_sideinfo_mode.upper()
+        if self.stage2_sideinfo_mode not in SUPPORTED_STAGE2_SIDEINFO_MODES:
+            raise ValueError(f"Unsupported stage2_sideinfo_mode: {self.stage2_sideinfo_mode}")
         self.learned_init_pattern = normalize_tone_pattern(self.learned_init_pattern)
         if self.train_cfo_grid_points < 0:
             raise ValueError("train_cfo_grid_points cannot be negative.")
@@ -250,6 +259,10 @@ class ExperimentConfig:
             raise ValueError("stage2_nonlinear_only_epochs must be positive.")
         if self.stage2_nonlinear_only_learning_rate <= 0.0:
             raise ValueError("stage2_nonlinear_only_learning_rate must be positive.")
+        if self.stage2_estimator_max_abs_cfo is not None:
+            self.stage2_estimator_max_abs_cfo = float(self.stage2_estimator_max_abs_cfo)
+            if self.stage2_estimator_max_abs_cfo <= 0.0:
+                raise ValueError("stage2_estimator_max_abs_cfo must be positive when set.")
         self.stage2_selection_abs_cfo_points = tuple(float(value) for value in self.stage2_selection_abs_cfo_points)
         self.stage2_selection_abs_cfo_weights = tuple(float(value) for value in self.stage2_selection_abs_cfo_weights)
         if not self.stage2_selection_abs_cfo_points:

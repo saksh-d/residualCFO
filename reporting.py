@@ -36,6 +36,16 @@ METHOD_ORDER = (
     "Learned",
     "LearnedOraclePreV",
     "LearnedOracleMMSE",
+    "LearnedOracleMMSEScale1p00",
+    "LearnedOracleMMSEScale0p90",
+    "LearnedOracleMMSEScale0p75",
+    "LearnedOracleMMSEScale0p50",
+    "LearnedOracleMMSEScale0p25",
+    "LearnedOracleMMSENoise0p00",
+    "LearnedOracleMMSENoise0p05",
+    "LearnedOracleMMSENoise0p10",
+    "LearnedOracleMMSENoise0p20",
+    "LearnedOracleMMSENoise0p40",
     "LearnedNonlinear",
     "LearnedNonlinearOracleEps",
     "LearnedSpectral",
@@ -60,6 +70,22 @@ METHOD_COLORS = {
     "LearnedNonlinearOracleEps": "#C74B50",
     "LearnedSpectral": "#2D8A5F",
 }
+ORACLE_MMSE_SCALE_PREFIX = "LearnedOracleMMSEScale"
+ORACLE_MMSE_SCALE_COLORS = {
+    "1p00": "#1B5E20",
+    "0p90": "#2E7D32",
+    "0p75": "#43A047",
+    "0p50": "#66BB6A",
+    "0p25": "#A5D6A7",
+}
+ORACLE_MMSE_NOISE_PREFIX = "LearnedOracleMMSENoise"
+ORACLE_MMSE_NOISE_COLORS = {
+    "0p00": "#1D4E89",
+    "0p05": "#2563B8",
+    "0p10": "#3B82F6",
+    "0p20": "#60A5FA",
+    "0p40": "#93C5FD",
+}
 
 
 def _progress_enabled(config: ExperimentConfig) -> bool:
@@ -75,34 +101,119 @@ def _stage2_decision_loss_label(config: ExperimentConfig) -> str:
     return r"$L_{\mathrm{BCE}}$" if config.stage2_decision_loss == "BIT_BCE" else r"$L_{\mathrm{CE}}$"
 
 
+def _oracle_mmse_scale_suffix(method: str) -> str | None:
+    if not method.startswith(ORACLE_MMSE_SCALE_PREFIX):
+        return None
+    suffix = method[len(ORACLE_MMSE_SCALE_PREFIX):]
+    return suffix or None
+
+
+def _oracle_mmse_scale_value(method: str) -> float | None:
+    suffix = _oracle_mmse_scale_suffix(method)
+    if suffix is None:
+        return None
+    try:
+        return float(suffix.replace("p", "."))
+    except ValueError:
+        return None
+
+
+def _oracle_mmse_noise_suffix(method: str) -> str | None:
+    if not method.startswith(ORACLE_MMSE_NOISE_PREFIX):
+        return None
+    suffix = method[len(ORACLE_MMSE_NOISE_PREFIX):]
+    return suffix or None
+
+
+def _oracle_mmse_noise_value(method: str) -> float | None:
+    suffix = _oracle_mmse_noise_suffix(method)
+    if suffix is None:
+        return None
+    try:
+        return float(suffix.replace("p", "."))
+    except ValueError:
+        return None
+
+
 def method_display_name(method: str) -> str:
+    scale = _oracle_mmse_scale_value(method)
+    if scale is not None:
+        return f"Learned + Oracle MMSE ({scale:.2f}x delta)"
+    noise_level = _oracle_mmse_noise_value(method)
+    if noise_level is not None:
+        return f"Learned + Oracle MMSE (noise sigma = {noise_level:.2f}|delta|)"
     return METHOD_DISPLAY_NAMES.get(method, method)
 
 
 def method_color(method: str) -> str:
+    suffix = _oracle_mmse_scale_suffix(method)
+    if suffix is not None:
+        return ORACLE_MMSE_SCALE_COLORS.get(suffix, "#2D8A5F")
+    noise_suffix = _oracle_mmse_noise_suffix(method)
+    if noise_suffix is not None:
+        return ORACLE_MMSE_NOISE_COLORS.get(noise_suffix, "#2563B8")
     return METHOD_COLORS.get(method, "#444444")
 
 
-def ordered_methods(methods: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+def ordered_methods(
+    methods: list[str] | tuple[str, ...] | set[str],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     available = list(methods)
-    preferred = [method for method in METHOD_ORDER if method in available]
-    extras = sorted(method for method in available if method not in METHOD_ORDER)
-    return preferred + extras
+    forced = []
+    if preferred_order is not None:
+        forced = [method for method in preferred_order if method in available]
+    preferred = forced + [method for method in METHOD_ORDER if method in available and method not in forced]
+    scale_methods = [
+        method
+        for method in available
+        if method not in preferred and method not in METHOD_ORDER and _oracle_mmse_scale_value(method) is not None
+    ]
+    scale_methods.sort(
+        key=lambda method: (-float(_oracle_mmse_scale_value(method) or 0.0), method),
+    )
+    noise_methods = [
+        method
+        for method in available
+        if method not in preferred and method not in METHOD_ORDER and _oracle_mmse_noise_value(method) is not None
+    ]
+    noise_methods.sort(
+        key=lambda method: (float(_oracle_mmse_noise_value(method) or 0.0), method),
+    )
+    extras = sorted(
+        method
+        for method in available
+        if (
+            method not in preferred
+            and method not in METHOD_ORDER
+            and _oracle_mmse_scale_value(method) is None
+            and _oracle_mmse_noise_value(method) is None
+        )
+    )
+    return preferred + scale_methods + noise_methods + extras
 
 
-def linear_method_order(schemes: dict[str, EvaluationScheme]) -> list[str]:
-    return [name for name in ordered_methods(schemes.keys()) if schemes[name].nonlinear_receiver is None]
+def linear_method_order(
+    schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    return [name for name in ordered_methods(schemes.keys(), preferred_order) if schemes[name].nonlinear_receiver is None]
 
 
-def transmitter_plot_method_order(schemes: dict[str, EvaluationScheme]) -> list[str]:
+def transmitter_plot_method_order(
+    schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     available = set(schemes.keys())
+    if preferred_order is not None:
+        return ordered_methods(available, preferred_order)
     order: list[str] = []
     for pair in (("OFDM", "OFDMNonlinear"), ("Learned", "LearnedNonlinear"), ("LearnedSpectral",)):
         for method in pair:
             if method in available:
                 order.append(method)
                 break
-    extras = [method for method in ordered_methods(available) if method not in order]
+    extras = [method for method in ordered_methods(available, preferred_order) if method not in order]
     return order + extras
 
 
@@ -251,11 +362,12 @@ def build_scheme_dict(
 def build_operator_df(
     config: ExperimentConfig,
     schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     eps_tensor = torch.tensor(config.operator_eval_cfo, device=config.device, dtype=torch.float32)
     rows: list[dict[str, float | int | str]] = []
     diag_rows: list[dict[str, float | int | str]] = []
-    for method in linear_method_order(schemes):
+    for method in linear_method_order(schemes, preferred_order):
         scheme = schemes[method]
         tx_basis = scheme.tx_basis
         rx_basis = scheme.rx_basis
@@ -310,10 +422,11 @@ def build_summary_df(
     training_result: TrainingResult,
     operator_df: pd.DataFrame,
     ber_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float | int | str | bool]] = []
     thresholds = robustness_thresholds(config.modulation)
-    for method in ordered_methods(ber_df["method"].unique().tolist()):
+    for method in ordered_methods(ber_df["method"].unique().tolist(), preferred_order):
         ber_group = average_metrics_by_abs_cfo(ber_df[ber_df["method"] == method]).sort_values("eps")
         op_group = operator_df[operator_df["method"] == method]
 
@@ -449,12 +562,15 @@ def build_ber_snr_df(
     return pd.concat(frames, ignore_index=True)
 
 
-def build_snr_summary_df(ber_snr_df: pd.DataFrame) -> pd.DataFrame:
+def build_snr_summary_df(
+    ber_snr_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
     if ber_snr_df.empty:
         return pd.DataFrame(rows)
     for eps, cfo_group in ber_snr_df.groupby("eps"):
-        for method in ordered_methods(cfo_group["method"].unique().tolist()):
+        for method in ordered_methods(cfo_group["method"].unique().tolist(), preferred_order):
             method_group = cfo_group[cfo_group["method"] == method].sort_values("eval_ebn0_db")
             rows.append(
                 {
@@ -475,6 +591,7 @@ def build_snr_summary_df(ber_snr_df: pd.DataFrame) -> pd.DataFrame:
 def build_constellation_df(
     config: ExperimentConfig,
     schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     _, symbols = sample_training_symbols(config.constellation_num_blocks, config)
     noise_var = 1.0 / (config.bits_per_symbol * (10 ** (float(config.eval_ebn0_db) / 10.0)))
@@ -497,7 +614,7 @@ def build_constellation_df(
             device=config.device,
             dtype=torch.float32,
         )
-        for method in ordered_methods(schemes.keys()):
+        for method in ordered_methods(schemes.keys(), preferred_order):
             scheme = schemes[method]
             tx_signal = transmit_symbols(symbols, scheme.tx_basis)
             rx_signal, _ = propagate(tx_signal, eps_tensor, config, ebn0_db=config.eval_ebn0_db, noise=noise)
@@ -540,9 +657,10 @@ def occupied_bandwidth(psd: np.ndarray, freq_axis: np.ndarray, fraction: float) 
 def build_spectral_outputs(
     config: ExperimentConfig,
     schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     freq_axis = np.linspace(-0.5, 0.5, config.spectral_fft_len, endpoint=False)
-    method_names = ordered_methods(schemes.keys())
+    method_names = ordered_methods(schemes.keys(), preferred_order)
     psd_accum = {method: np.zeros(config.spectral_fft_len, dtype=np.float64) for method in method_names}
     papr_frames: list[pd.DataFrame] = []
 
@@ -1456,8 +1574,9 @@ def plot_training_loss_components(config: ExperimentConfig, history_df: pd.DataF
 def plot_operator_heatmaps(
     config: ExperimentConfig,
     schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> Path | None:
-    linear_methods = linear_method_order(schemes)
+    linear_methods = linear_method_order(schemes, preferred_order)
     if not linear_methods:
         return None
     eps_tensor = torch.tensor(config.heatmap_cfo, device=config.device, dtype=torch.float32)
@@ -1490,9 +1609,13 @@ def plot_operator_heatmaps(
     return path
 
 
-def plot_offdiag_leakage(config: ExperimentConfig, operator_df: pd.DataFrame) -> Path:
+def plot_offdiag_leakage(
+    config: ExperimentConfig,
+    operator_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path:
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(operator_df["method"].unique().tolist()):
+    for method in ordered_methods(operator_df["method"].unique().tolist(), preferred_order):
         group = operator_df[operator_df["method"] == method].sort_values("eps")
         plt.plot(
             group["eps"],
@@ -1514,11 +1637,15 @@ def plot_offdiag_leakage(config: ExperimentConfig, operator_df: pd.DataFrame) ->
     return path
 
 
-def plot_nearest_neighbor_leakage(config: ExperimentConfig, operator_df: pd.DataFrame) -> Path | None:
+def plot_nearest_neighbor_leakage(
+    config: ExperimentConfig,
+    operator_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if operator_df.empty or "nearest_neighbor_leakage" not in operator_df.columns:
         return None
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(operator_df["method"].unique().tolist()):
+    for method in ordered_methods(operator_df["method"].unique().tolist(), preferred_order):
         group = operator_df[operator_df["method"] == method].sort_values("eps")
         plt.plot(
             group["eps"],
@@ -1541,12 +1668,16 @@ def plot_nearest_neighbor_leakage(config: ExperimentConfig, operator_df: pd.Data
     return path
 
 
-def plot_ber_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | None:
+def plot_ber_curve(
+    config: ExperimentConfig,
+    ber_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if ber_df.empty:
         return None
     plot_df = average_metrics_by_abs_cfo(ber_df) if config.stage2_enabled else ber_df
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(plot_df["method"].unique().tolist()):
+    for method in ordered_methods(plot_df["method"].unique().tolist(), preferred_order):
         group = plot_df[plot_df["method"] == method].sort_values("eps")
         plt.semilogy(
             group["eps"],
@@ -1568,7 +1699,7 @@ def plot_ber_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | Non
     plt.close(fig)
     if config.stage2_enabled:
         signed_fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-        for method in ordered_methods(ber_df["method"].unique().tolist()):
+        for method in ordered_methods(ber_df["method"].unique().tolist(), preferred_order):
             group = ber_df[ber_df["method"] == method].sort_values("eps")
             plt.semilogy(
                 group["eps"],
@@ -1590,12 +1721,16 @@ def plot_ber_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | Non
     return path
 
 
-def plot_evm_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | None:
+def plot_evm_curve(
+    config: ExperimentConfig,
+    ber_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if ber_df.empty:
         return None
     plot_df = average_metrics_by_abs_cfo(ber_df) if config.stage2_enabled else ber_df
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ordered_methods(plot_df["method"].unique().tolist()):
+    for method in ordered_methods(plot_df["method"].unique().tolist(), preferred_order):
         group = plot_df[plot_df["method"] == method].sort_values("eps")
         plt.plot(
             group["eps"],
@@ -1618,7 +1753,11 @@ def plot_evm_curve(config: ExperimentConfig, ber_df: pd.DataFrame) -> Path | Non
     return path
 
 
-def plot_ber_vs_snr_by_cfo(config: ExperimentConfig, ber_snr_df: pd.DataFrame) -> Path | None:
+def plot_ber_vs_snr_by_cfo(
+    config: ExperimentConfig,
+    ber_snr_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if ber_snr_df.empty:
         return None
     cfo_values = [float(eps) for eps in sorted(ber_snr_df["eps"].unique())]
@@ -1632,7 +1771,7 @@ def plot_ber_vs_snr_by_cfo(config: ExperimentConfig, ber_snr_df: pd.DataFrame) -
     )
     for ax, eps in zip(axes[0], cfo_values):
         cfo_group = ber_snr_df[ber_snr_df["eps"] == eps]
-        for method in ordered_methods(cfo_group["method"].unique().tolist()):
+        for method in ordered_methods(cfo_group["method"].unique().tolist(), preferred_order):
             method_group = cfo_group[cfo_group["method"] == method].sort_values("eval_ebn0_db")
             ax.semilogy(
                 method_group["eval_ebn0_db"],
@@ -1696,11 +1835,15 @@ def plot_redundancy_ablation_ber(
     return path
 
 
-def plot_constellation_snapshots(config: ExperimentConfig, constellation_df: pd.DataFrame) -> Path | None:
+def plot_constellation_snapshots(
+    config: ExperimentConfig,
+    constellation_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if constellation_df.empty:
         return None
     cfo_values = [float(eps) for eps in sorted(constellation_df["eps"].unique())]
-    method_names = ordered_methods(constellation_df["method"].unique().tolist())
+    method_names = ordered_methods(constellation_df["method"].unique().tolist(), preferred_order)
     fig, axes = plt.subplots(
         len(method_names),
         len(cfo_values),
@@ -1785,10 +1928,14 @@ def plot_frequency_domain_random(config: ExperimentConfig, learned_tx: torch.Ten
     return path
 
 
-def plot_time_domain_waveform(config: ExperimentConfig, schemes: dict[str, EvaluationScheme]) -> Path:
+def plot_time_domain_waveform(
+    config: ExperimentConfig,
+    schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path:
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
-    method_names = transmitter_plot_method_order(schemes)
+    method_names = transmitter_plot_method_order(schemes, preferred_order)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -1812,10 +1959,11 @@ def plot_time_domain_waveform(config: ExperimentConfig, schemes: dict[str, Evalu
 def plot_time_domain_envelope_phase(
     config: ExperimentConfig,
     schemes: dict[str, EvaluationScheme],
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> Path:
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
-    method_names = transmitter_plot_method_order(schemes)
+    method_names = transmitter_plot_method_order(schemes, preferred_order)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -1836,11 +1984,15 @@ def plot_time_domain_envelope_phase(
     return path
 
 
-def plot_papr_ccdf(config: ExperimentConfig, papr_df: pd.DataFrame) -> Path | None:
+def plot_papr_ccdf(
+    config: ExperimentConfig,
+    papr_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
+) -> Path | None:
     if papr_df.empty:
         return None
     fig = plt.figure(figsize=(7.6, 4.4), dpi=130)
-    for method in ordered_methods(papr_df["method"].unique().tolist()):
+    for method in ordered_methods(papr_df["method"].unique().tolist(), preferred_order):
         values = np.sort(papr_df[papr_df["method"] == method]["papr_db"].to_numpy())
         if values.size == 0:
             continue
@@ -1868,6 +2020,7 @@ def plot_spectral_fairness(
     config: ExperimentConfig,
     spectral_df: pd.DataFrame,
     papr_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> Path | None:
     if spectral_df.empty:
         return None
@@ -1875,7 +2028,7 @@ def plot_spectral_fairness(
 
     nominal_width = config.payload_bin_count if config.frame_structure_enabled else config.N
     nominal_edge = nominal_width / (2.0 * config.M)
-    for method in ordered_methods(spectral_df["method"].unique().tolist()):
+    for method in ordered_methods(spectral_df["method"].unique().tolist(), preferred_order):
         group = spectral_df[spectral_df["method"] == method].sort_values("frequency")
         axes[0].plot(
             group["frequency"],
@@ -1892,7 +2045,7 @@ def plot_spectral_fairness(
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    for method in ordered_methods(papr_df["method"].unique().tolist()):
+    for method in ordered_methods(papr_df["method"].unique().tolist(), preferred_order):
         values = np.sort(papr_df[papr_df["method"] == method]["papr_db"].to_numpy())
         if values.size == 0:
             continue
@@ -1923,6 +2076,20 @@ def plot_spectral_fairness(
 
 def build_mapping_markdown(config: ExperimentConfig) -> str:
     if config.stage2_enabled:
+        if getattr(config, "stage2_sideinfo_enabled", False):
+            return "\n".join(
+                [
+                    "**Stage 2 Post-V Adaptive Refinement**",
+                    "",
+                    rf"$z_0 = V y,\quad \hat{{\delta}}_{{\mathrm{{coarse}}}} = {config.stage2_sideinfo_scale:.2f}\delta,\quad \hat{{\delta}} = \hat{{\delta}}_{{\mathrm{{coarse}}}} + g_\theta(z_0, \hat{{\delta}}_{{\mathrm{{coarse}}}}),\quad \hat{{s}} = G(\hat{{\delta}}) z_0$",
+                    "",
+                    "- The Stage 1 linear receiver remains the interpretable front-end.",
+                    "- Stage 2 starts from a conservative coarse CFO seed and trains a compact residual estimator on top of `z_0` before the MMSE solve.",
+                    "- The correction matrix is built from the fixed front-end operator `A(hat(delta)) = V Phi_hat(delta) W` and applied through a regularized symbol-domain solve.",
+                    "- `W` and `V` remain frozen in the main Stage 2 experiment so any BER gain is attributable to post-`V` adaptation rather than front-end retuning.",
+                    "- BER is decoded from the shared complex-symbol slicer so all methods use identical hard-decision semantics.",
+                ]
+            )
         return "\n".join(
             [
                 "**Stage 2 Post-V Adaptive Refinement**",
@@ -1988,8 +2155,34 @@ def build_summary_markdown(
     snr_summary_df: pd.DataFrame,
     spectral_summary_df: pd.DataFrame,
     papr_summary_df: pd.DataFrame,
+    preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     if config.stage2_enabled:
+        available_methods = set(summary_df["method"].astype(str).tolist())
+        required_four_way = {"OFDM", "OFDMNonlinear", "Learned", "LearnedNonlinear"}
+        if not required_four_way.issubset(available_methods):
+            lines = ["**Stage 2 Diagnostic Summary**"]
+            lines.append(
+                f"- Configuration: `{config.modulation}`, `N={config.N}`, `M={config.M}`, train `{config.train_ebn0_db:.0f} dB`, eval `{config.eval_ebn0_db:.0f} dB`."
+            )
+            lines.append(f"- Stage 1 checkpoint source: `{config.stage2_checkpoint_source_path or config.stage2_checkpoint_path}`.")
+            lines.append(
+                f"- Methods: `{', '.join(ordered_methods(summary_df['method'].astype(str).unique().tolist(), preferred_order))}`."
+            )
+            if not stage_summary_df.empty:
+                for _, row in stage_summary_df.iterrows():
+                    lines.append(
+                        f"- {row['scheme']} {row['stage']}: best epoch `{int(row.get('best_stage_epoch', row['best_global_epoch']))}`, "
+                        f"val BER `{row['val_ber']:.4e}`, hard-CFO BER `{row['hard_cfo_weighted_ber']:.4e}`."
+                    )
+            for method in ordered_methods(summary_df["method"].astype(str).unique().tolist(), preferred_order):
+                row = summary_df[summary_df["method"] == method].iloc[0]
+                lines.append(
+                    f"- {method_display_name(method)}: BER(0) `{row['ber_at_0']:.3e}`, "
+                    f"BER(0.05) `{row['ber_at_0p05']:.3e}`, BER(0.10) `{row['ber_at_0p10']:.3e}`."
+                )
+            return "\n".join(lines)
+
         lines = ["**Stage 2 Four-Way Comparison Summary**"]
         lines.append(
             f"- Configuration: `{config.modulation}`, `N={config.N}`, `M={config.M}`, train `{config.train_ebn0_db:.0f} dB`, eval `{config.eval_ebn0_db:.0f} dB`."
@@ -2153,10 +2346,9 @@ def run_final_evaluation(
     schemes: dict[str, EvaluationScheme] | None = None,
     method_order: tuple[str, ...] | None = None,
 ) -> ExperimentResult:
-    del method_order
     schemes = build_scheme_dict(config, training_result) if schemes is None else schemes
     _log_progress(config, "[Eval] Building operator diagnostics")
-    operator_df, diagonal_df = build_operator_df(config, schemes)
+    operator_df, diagonal_df = build_operator_df(config, schemes, preferred_order=method_order)
     _log_progress(config, "[Eval] BER vs CFO sweep")
     ber_df = evaluate_scheme_set(
         config=config,
@@ -2171,11 +2363,15 @@ def run_final_evaluation(
     _log_progress(config, "[Eval] BER vs SNR slices")
     ber_snr_df = build_ber_snr_df(config, schemes)
     _log_progress(config, "[Eval] Constellation snapshots")
-    constellation_df = build_constellation_df(config, schemes)
+    constellation_df = build_constellation_df(config, schemes, preferred_order=method_order)
     _log_progress(config, "[Eval] Spectral and PAPR outputs")
-    spectral_df, spectral_summary_df, papr_df, papr_summary_df = build_spectral_outputs(config, schemes)
-    summary_df = build_summary_df(config, training_result, operator_df, ber_df)
-    snr_summary_df = build_snr_summary_df(ber_snr_df)
+    spectral_df, spectral_summary_df, papr_df, papr_summary_df = build_spectral_outputs(
+        config,
+        schemes,
+        preferred_order=method_order,
+    )
+    summary_df = build_summary_df(config, training_result, operator_df, ber_df, preferred_order=method_order)
+    snr_summary_df = build_snr_summary_df(ber_snr_df, preferred_order=method_order)
     _log_progress(config, "[Eval] Writing CSV artifacts")
     artifact_paths = save_artifacts(
         config,
@@ -2195,34 +2391,38 @@ def run_final_evaluation(
     _log_progress(config, "[Eval] Rendering plots")
     artifact_paths["training_plot"] = plot_training_diagnostics(config, training_result.history_df)
     artifact_paths["training_loss_components_plot"] = plot_training_loss_components(config, training_result.history_df)
-    operator_heatmap = plot_operator_heatmaps(config, schemes)
+    operator_heatmap = plot_operator_heatmaps(config, schemes, preferred_order=method_order)
     if operator_heatmap is not None:
         artifact_paths["operator_heatmap_plot"] = operator_heatmap
     if not operator_df.empty:
-        artifact_paths["offdiag_plot"] = plot_offdiag_leakage(config, operator_df)
-        nn_plot = plot_nearest_neighbor_leakage(config, operator_df)
+        artifact_paths["offdiag_plot"] = plot_offdiag_leakage(config, operator_df, preferred_order=method_order)
+        nn_plot = plot_nearest_neighbor_leakage(config, operator_df, preferred_order=method_order)
         if nn_plot is not None:
             artifact_paths["nearest_neighbor_plot"] = nn_plot
-    ber_plot = plot_ber_curve(config, ber_df)
+    ber_plot = plot_ber_curve(config, ber_df, preferred_order=method_order)
     if ber_plot is not None:
         artifact_paths["ber_plot"] = ber_plot
-    evm_plot = plot_evm_curve(config, ber_df)
+    evm_plot = plot_evm_curve(config, ber_df, preferred_order=method_order)
     if evm_plot is not None:
         artifact_paths["evm_plot"] = evm_plot
-    ber_snr_plot = plot_ber_vs_snr_by_cfo(config, ber_snr_df)
+    ber_snr_plot = plot_ber_vs_snr_by_cfo(config, ber_snr_df, preferred_order=method_order)
     if ber_snr_plot is not None:
         artifact_paths["ber_snr_plot"] = ber_snr_plot
-    constellation_plot = plot_constellation_snapshots(config, constellation_df)
+    constellation_plot = plot_constellation_snapshots(config, constellation_df, preferred_order=method_order)
     if constellation_plot is not None:
         artifact_paths["constellation_plot"] = constellation_plot
     artifact_paths["freq_all_plot"] = plot_frequency_domain_all(config, training_result.learned_tx)
     artifact_paths["freq_random_plot"] = plot_frequency_domain_random(config, training_result.learned_tx)
-    artifact_paths["time_waveform_plot"] = plot_time_domain_waveform(config, schemes)
-    artifact_paths["time_envelope_phase_plot"] = plot_time_domain_envelope_phase(config, schemes)
-    papr_ccdf_plot = plot_papr_ccdf(config, papr_df)
+    artifact_paths["time_waveform_plot"] = plot_time_domain_waveform(config, schemes, preferred_order=method_order)
+    artifact_paths["time_envelope_phase_plot"] = plot_time_domain_envelope_phase(
+        config,
+        schemes,
+        preferred_order=method_order,
+    )
+    papr_ccdf_plot = plot_papr_ccdf(config, papr_df, preferred_order=method_order)
     if papr_ccdf_plot is not None:
         artifact_paths["papr_ccdf_plot"] = papr_ccdf_plot
-    spectral_plot = plot_spectral_fairness(config, spectral_df, papr_df)
+    spectral_plot = plot_spectral_fairness(config, spectral_df, papr_df, preferred_order=method_order)
     if spectral_plot is not None:
         artifact_paths["spectral_fairness_plot"] = spectral_plot
 
@@ -2235,6 +2435,7 @@ def run_final_evaluation(
         snr_summary_df=snr_summary_df,
         spectral_summary_df=spectral_summary_df,
         papr_summary_df=papr_summary_df,
+        preferred_order=method_order,
     )
     return ExperimentResult(
         learned_tx=training_result.learned_tx,

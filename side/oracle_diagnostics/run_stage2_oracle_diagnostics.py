@@ -14,41 +14,50 @@ if str(ROOT_DIR) not in sys.path:
 
 from comm_core import (
     TrainingResult,
-    default_config,
     ebn0_to_noise_variance,
     file_sha256,
     load_stage1_checkpoint,
     refresh_output_dir,
-    run_stage2_experiment,
     set_seed,
     snapshot_stage1_checkpoint,
     stage2_checkpoint_preflight,
 )
-from receiver import EvaluationScheme, evaluate_scheme_set, train_stage2_nonlinear_receiver
-from reporting import method_color, method_display_name, plot_ber_curve_multi, run_final_evaluation
+from receiver import EvaluationScheme, train_stage2_nonlinear_receiver
+from reporting import (
+    average_metrics_by_abs_cfo,
+    method_color,
+    method_display_name,
+    plot_ber_curve_multi,
+    plot_nearest_neighbor_leakage,
+    plot_offdiag_leakage,
+    plot_operator_heatmaps,
+    plot_papr_ccdf,
+    plot_spectral_fairness,
+    plot_time_domain_envelope_phase,
+    plot_time_domain_waveform,
+    run_final_evaluation,
+)
 from run_stage1_linear import build_stage1_linear_config
-from transmitter import make_ofdm_baseline_transceiver
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = SCRIPT_DIR / "stage2_oracle_diagnostics"
-OUTPUT_SUBDIR = "oracle_n44_r6"
 REFRESH_OUTPUT_DIR = True
 
-STAGE1_OUTPUT_DIR = ROOT_DIR / "stage1_linear_outputs" / "16qam_n44_r6"
+STAGE1_REFERENCE_CONFIG = build_stage1_linear_config(refresh_output_dir=False)
+OUTPUT_SUBDIR = f"oracle_n{STAGE1_REFERENCE_CONFIG.N}_r{STAGE1_REFERENCE_CONFIG.redundancy_dimensions}"
+STAGE1_OUTPUT_DIR = STAGE1_REFERENCE_CONFIG.output_dir
 STAGE1_CHECKPOINT_PATH = STAGE1_OUTPUT_DIR / "stage1_checkpoint.pt"
 
-NONLINEAR_ONLY_SUMMARY_PATH = ROOT_DIR / "stage2_nonlinear_outputs" / "nonlinear_only_n44_r6" / "summary_metrics.csv"
-
-ORACLE_METHOD_ORDER = (
-    "OFDM",
-    "Learned",
-    "LearnedOraclePreV",
-    "LearnedOracleMMSE",
-    "LearnedNonlinearOracleEps",
-)
-ALPHA_SCALES = (0.25, 1.0, 4.0)
+ORACLE_MMSE_SCALES = (1.00, 0.50, 0.15, 0.05, 0.01)
 KEY_EPS = (0.0, 0.05, 0.10)
+
+
+def _scale_method_name(scale: float) -> str:
+    return f"LearnedOracleMMSEScale{scale:.2f}".replace(".", "p")
+
+
+ORACLE_METHOD_ORDER = ("Learned",) + tuple(_scale_method_name(scale) for scale in ORACLE_MMSE_SCALES)
 
 
 def build_stage2_oracle_diagnostic_config(
@@ -106,74 +115,56 @@ def _prepare_stage2_checkpoint(config: object) -> tuple[dict[str, object], Path]
     return checkpoint, checkpoint_snapshot_path
 
 
-def _build_oracle_schemes(config: object, learned_tx, learned_rx, nonlinear_receiver) -> dict[str, EvaluationScheme]:
-    ofdm_tx, ofdm_rx = make_ofdm_baseline_transceiver(config)
+def _build_oracle_schemes(config: object, learned_tx, learned_rx) -> dict[str, EvaluationScheme]:
     mmse_alpha = ebn0_to_noise_variance(config.eval_ebn0_db, config.bits_per_symbol)
-    return {
-        "OFDM": EvaluationScheme(tx_basis=ofdm_tx, rx_basis=ofdm_rx, nonlinear_receiver=None),
+    schemes = {
         "Learned": EvaluationScheme(tx_basis=learned_tx, rx_basis=learned_rx, nonlinear_receiver=None),
-        "LearnedOraclePreV": EvaluationScheme(
-            tx_basis=learned_tx,
-            rx_basis=learned_rx,
-            nonlinear_receiver=None,
-            oracle_pre_v_cfo=True,
-        ),
-        "LearnedOracleMMSE": EvaluationScheme(
+    }
+    for scale in ORACLE_MMSE_SCALES:
+        schemes[_scale_method_name(scale)] = EvaluationScheme(
             tx_basis=learned_tx,
             rx_basis=learned_rx,
             nonlinear_receiver=None,
             oracle_post_v_mmse=True,
             oracle_mmse_alpha=mmse_alpha,
-        ),
-        "LearnedNonlinearOracleEps": EvaluationScheme(
-            tx_basis=learned_tx,
-            rx_basis=learned_rx,
-            nonlinear_receiver=nonlinear_receiver,
-            oracle_eps_conditioning=True,
-        ),
-    }
-
-
-def _build_oracle_alpha_sensitivity(config: object, learned_tx, learned_rx, baseline_ber_df: pd.DataFrame) -> pd.DataFrame:
-    base_alpha = ebn0_to_noise_variance(config.eval_ebn0_db, config.bits_per_symbol)
-    frames: list[pd.DataFrame] = []
-    for scale_idx, scale in enumerate(ALPHA_SCALES):
-        alpha = scale * base_alpha
-        scheme = EvaluationScheme(
-            tx_basis=learned_tx,
-            rx_basis=learned_rx,
-            nonlinear_receiver=None,
-            oracle_post_v_mmse=True,
-            oracle_mmse_alpha=alpha,
+            oracle_mmse_eps_scale=float(scale),
         )
-        frame = evaluate_scheme_set(
-            config=config,
-            schemes={"LearnedOracleMMSE": scheme},
-            cfo_points=np.array(KEY_EPS, dtype=float),
-            ebn0_db=config.eval_ebn0_db,
-            num_blocks=config.ber_blocks,
-            batch_size=config.ber_batch_size,
-            seed=88_000 + scale_idx,
-            progress_label=f"Oracle MMSE alpha x{scale:g}",
-        ).copy()
-        frame["method_label"] = frame["method"].map(method_display_name)
-        frame["alpha_scale"] = float(scale)
-        frame["alpha"] = float(alpha)
-        frames.append(frame)
-    sensitivity_df = pd.concat(frames, ignore_index=True)
-    learned_baseline = baseline_ber_df[baseline_ber_df["method"] == "Learned"][["eps", "ber"]].rename(
+    return schemes
+
+
+def _build_oracle_scale_sensitivity(ber_df: pd.DataFrame) -> pd.DataFrame:
+    learned_baseline = average_metrics_by_abs_cfo(ber_df[ber_df["method"] == "Learned"])[["eps", "ber"]].rename(
         columns={"ber": "learned_ber"}
     )
+    frames: list[pd.DataFrame] = []
+    key_eps_array = np.array(KEY_EPS, dtype=float)
+    for scale in ORACLE_MMSE_SCALES:
+        method = _scale_method_name(scale)
+        frame = average_metrics_by_abs_cfo(ber_df[ber_df["method"] == method])[["eps", "ber", "ser", "evm"]].copy()
+        frame = frame[np.isclose(frame["eps"].to_numpy()[:, None], key_eps_array[None, :], atol=1e-9).any(axis=1)]
+        if frame.empty:
+            continue
+        frame["method"] = method
+        frame["method_label"] = frame["method"].map(method_display_name)
+        frame["oracle_mmse_eps_scale"] = float(scale)
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    sensitivity_df = pd.concat(frames, ignore_index=True)
     sensitivity_df = sensitivity_df.merge(learned_baseline, on="eps", how="left")
     sensitivity_df["delta_ber_vs_learned"] = sensitivity_df["ber"] - sensitivity_df["learned_ber"]
-    return sensitivity_df.sort_values(["alpha_scale", "eps"], kind="stable").reset_index(drop=True)
+    return sensitivity_df.sort_values(
+        ["oracle_mmse_eps_scale", "eps"],
+        ascending=[False, True],
+        kind="stable",
+    ).reset_index(drop=True)
 
 
 def _plot_oracle_gain(result, output_dir: Path) -> Path:
     ber_df = result.ber_df.copy()
     baseline = ber_df[ber_df["method"] == "Learned"][["eps", "ber"]].rename(columns={"ber": "learned_ber"})
     fig = plt.figure(figsize=(7.8, 4.4), dpi=130)
-    for method in ("LearnedOraclePreV", "LearnedOracleMMSE", "LearnedNonlinearOracleEps"):
+    for method in ORACLE_METHOD_ORDER[1:]:
         frame = ber_df[ber_df["method"] == method][["eps", "ber"]].merge(baseline, on="eps", how="left")
         if frame.empty:
             continue
@@ -200,8 +191,8 @@ def _plot_oracle_gain(result, output_dir: Path) -> Path:
 def _plot_oracle_constellations(result, output_dir: Path) -> Path:
     plot_df = result.constellation_df.copy()
     plot_df = plot_df[np.isclose(plot_df["eps"], 0.10)]
-    methods = ["Learned", "LearnedOraclePreV", "LearnedOracleMMSE", "LearnedNonlinearOracleEps"]
-    fig, axes = plt.subplots(1, len(methods), figsize=(15.2, 3.8), dpi=130, constrained_layout=True)
+    methods = list(ORACLE_METHOD_ORDER)
+    fig, axes = plt.subplots(1, len(methods), figsize=(3.9 * len(methods), 3.8), dpi=130, constrained_layout=True)
     for ax, method in zip(axes, methods):
         frame = plot_df[plot_df["method"] == method]
         if frame.empty:
@@ -218,16 +209,6 @@ def _plot_oracle_constellations(result, output_dir: Path) -> Path:
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
-
-
-def _load_saved_stage2_row(path: Path) -> pd.Series | None:
-    if not path.exists():
-        return None
-    summary_df = pd.read_csv(path)
-    frame = summary_df[summary_df["method"] == "LearnedNonlinear"]
-    if frame.empty:
-        return None
-    return frame.iloc[0]
 
 
 def _nearest_row(summary_df: pd.DataFrame, method: str) -> pd.Series:
@@ -266,27 +247,90 @@ def _diagnostic_takeaway(method_row: pd.Series, learned_row: pd.Series) -> str:
     )
 
 
+def _collect_figure_paths(result) -> list[Path]:
+    preferred_keys = (
+        "training_plot",
+        "training_loss_components_plot",
+        "operator_heatmap_plot",
+        "offdiag_plot",
+        "nearest_neighbor_plot",
+        "ber_plot",
+        "evm_plot",
+        "ber_snr_plot",
+        "constellation_plot",
+        "freq_all_plot",
+        "freq_random_plot",
+        "time_waveform_plot",
+        "time_envelope_phase_plot",
+        "papr_ccdf_plot",
+        "spectral_fairness_plot",
+        "oracle_ber_comparison_plot",
+        "oracle_gain_plot",
+        "oracle_constellation_plot",
+    )
+    figure_paths: list[Path] = []
+    seen: set[Path] = set()
+    for key in preferred_keys:
+        path = result.artifact_paths.get(key)
+        if path is None:
+            continue
+        resolved = Path(path)
+        if resolved.exists() and resolved.suffix.lower() in {".png", ".jpg", ".jpeg"} and resolved not in seen:
+            figure_paths.append(resolved)
+            seen.add(resolved)
+    for path in result.artifact_paths.values():
+        resolved = Path(path)
+        if resolved.exists() and resolved.suffix.lower() in {".png", ".jpg", ".jpeg"} and resolved not in seen:
+            figure_paths.append(resolved)
+            seen.add(resolved)
+    return figure_paths
+
+
+def _rerender_collapsed_geometry_plots(config: object, result, schemes: dict[str, EvaluationScheme]) -> None:
+    learned_only_schemes = {"Learned": schemes["Learned"]}
+    learned_operator_df = result.operator_df[result.operator_df["method"] == "Learned"].copy()
+    learned_spectral_df = result.spectral_df[result.spectral_df["method"] == "Learned"].copy()
+    learned_papr_df = result.papr_df[result.papr_df["method"] == "Learned"].copy()
+
+    operator_heatmap = plot_operator_heatmaps(config, learned_only_schemes)
+    if operator_heatmap is not None:
+        result.artifact_paths["operator_heatmap_plot"] = operator_heatmap
+    if not learned_operator_df.empty:
+        result.artifact_paths["offdiag_plot"] = plot_offdiag_leakage(config, learned_operator_df)
+        nn_plot = plot_nearest_neighbor_leakage(config, learned_operator_df)
+        if nn_plot is not None:
+            result.artifact_paths["nearest_neighbor_plot"] = nn_plot
+    result.artifact_paths["time_waveform_plot"] = plot_time_domain_waveform(config, learned_only_schemes)
+    result.artifact_paths["time_envelope_phase_plot"] = plot_time_domain_envelope_phase(config, learned_only_schemes)
+    papr_ccdf_plot = plot_papr_ccdf(config, learned_papr_df)
+    if papr_ccdf_plot is not None:
+        result.artifact_paths["papr_ccdf_plot"] = papr_ccdf_plot
+    spectral_plot = plot_spectral_fairness(config, learned_spectral_df, learned_papr_df)
+    if spectral_plot is not None:
+        result.artifact_paths["spectral_fairness_plot"] = spectral_plot
+
+
 def _write_oracle_report(
     config: object,
     result,
     sensitivity_df: pd.DataFrame,
     output_dir: Path,
-    comparison_plot: Path,
-    gain_plot: Path,
-    constellation_plot: Path,
 ) -> Path:
     summary_df = result.summary_df.copy()
     learned_row = _nearest_row(summary_df, "Learned")
-    pre_v_row = _nearest_row(summary_df, "LearnedOraclePreV")
-    mmse_row = _nearest_row(summary_df, "LearnedOracleMMSE")
-    oracle_eps_row = _nearest_row(summary_df, "LearnedNonlinearOracleEps")
-    current_nonlinear_only = _load_saved_stage2_row(NONLINEAR_ONLY_SUMMARY_PATH)
+    figure_paths = _collect_figure_paths(result)
 
-    best_mmse = sensitivity_df.sort_values(["eps", "ber"], kind="stable").groupby("eps", as_index=False).first()
-    best_mmse_lines = [
-        f"- Best MMSE alpha at delta={row['eps']:.2f}: scale `{row['alpha_scale']:.2f}` with BER `{row['ber']:.6f}`."
-        for _, row in best_mmse.iterrows()
-    ]
+    best_mmse_lines: list[str] = []
+    if not sensitivity_df.empty:
+        best_mmse = sensitivity_df.sort_values(
+            ["eps", "ber", "oracle_mmse_eps_scale"],
+            ascending=[True, True, False],
+            kind="stable",
+        ).groupby("eps", as_index=False).first()
+        best_mmse_lines = [
+            f"- Best BER at delta={row['eps']:.2f}: `{row['method_label']}` with BER `{row['ber']:.6f}`."
+            for _, row in best_mmse.iterrows()
+        ]
 
     lines = [
         "# Stage 2 Oracle Diagnostics",
@@ -295,51 +339,49 @@ def _write_oracle_report(
         f"- Stage 1 checkpoint: `{config.stage2_checkpoint_source_path}`",
         f"- Configuration: `{config.modulation}`, `M={config.M}`, `K={config.K}`, `N={config.N}`, `P={config.N_pilots}`, `G={config.N_guard}`.",
         f"- Train/Eval SNR: train `{config.train_ebn0_db:.1f} dB`, eval `{config.eval_ebn0_db:.1f} dB`.",
+        f"- Methods: `{', '.join(ORACLE_METHOD_ORDER)}`",
         "",
-        "## Test A: Oracle CFO correction before V",
-        _delta_line(pre_v_row, learned_row, "0.00", "ber_at_0"),
-        _delta_line(pre_v_row, learned_row, "0.05", "ber_at_0p05"),
-        _delta_line(pre_v_row, learned_row, "0.10", "ber_at_0p10"),
-        _diagnostic_takeaway(pre_v_row, learned_row),
-        "",
-        "## Test B: Oracle delta-conditioned MMSE after V",
-        _delta_line(mmse_row, learned_row, "0.00", "ber_at_0"),
-        _delta_line(mmse_row, learned_row, "0.05", "ber_at_0p05"),
-        _delta_line(mmse_row, learned_row, "0.10", "ber_at_0p10"),
-        _diagnostic_takeaway(mmse_row, learned_row),
-        *best_mmse_lines,
-        "",
-        "## Test C: Current Stage 2 detector with true delta conditioning",
-        _delta_line(oracle_eps_row, learned_row, "0.00", "ber_at_0"),
-        _delta_line(oracle_eps_row, learned_row, "0.05", "ber_at_0p05"),
-        _delta_line(oracle_eps_row, learned_row, "0.10", "ber_at_0p10"),
-        _diagnostic_takeaway(oracle_eps_row, learned_row),
     ]
-    if current_nonlinear_only is not None:
-        lines.append(
-            f"- Versus saved `nonlinear_only`: BER(0.05) `{float(oracle_eps_row['ber_at_0p05']):.6f}` vs `{float(current_nonlinear_only['ber_at_0p05']):.6f}`, "
-            f"BER(0.10) `{float(oracle_eps_row['ber_at_0p10']):.6f}` vs `{float(current_nonlinear_only['ber_at_0p10']):.6f}`."
+    for scale in ORACLE_MMSE_SCALES:
+        method = _scale_method_name(scale)
+        method_row = _nearest_row(summary_df, method)
+        lines.extend(
+            [
+                f"## Oracle MMSE scale `{scale:.2f}`",
+                _delta_line(method_row, learned_row, "0.00", "ber_at_0"),
+                _delta_line(method_row, learned_row, "0.05", "ber_at_0p05"),
+                _delta_line(method_row, learned_row, "0.10", "ber_at_0p10"),
+                _diagnostic_takeaway(method_row, learned_row),
+                "",
+            ]
         )
+    if best_mmse_lines:
+        lines.extend(["## Best Scale by CFO", *best_mmse_lines, ""])
 
     lines.extend(
         [
-            "",
             "## Files",
             f"- [summary_metrics.csv]({(output_dir / 'summary_metrics.csv').name})",
             f"- [ber_vs_cfo.csv]({(output_dir / 'ber_vs_cfo.csv').name})",
             f"- [ber_vs_snr_by_cfo.csv]({(output_dir / 'ber_vs_snr_by_cfo.csv').name})",
-            f"- [oracle_alpha_sensitivity.csv]({(output_dir / 'oracle_alpha_sensitivity.csv').name})",
+            f"- [oracle_mmse_scale_sensitivity.csv]({(output_dir / 'oracle_mmse_scale_sensitivity.csv').name})",
             f"- [stage_summary.csv]({(output_dir / 'stage_summary.csv').name})",
             f"- [stage_training_history.csv]({(output_dir / 'stage_training_history.csv').name})",
-            "",
-            f"![Oracle BER Comparison]({comparison_plot.name})",
-            "",
-            f"![Oracle Gain vs Baseline]({gain_plot.name})",
-            "",
-            f"![Oracle Constellation Snapshots]({constellation_plot.name})",
-            "",
         ]
     )
+    if figure_paths:
+        lines.extend(["", "## Figures", ""])
+        for path in figure_paths:
+            lines.extend(
+                [
+                    f"### {path.stem.replace('_', ' ').title()}",
+                    "",
+                    f"[{path.name}]({path.name})",
+                    "",
+                    f"![{path.name}]({path.name})",
+                    "",
+                ]
+            )
     report_path = output_dir / "report.md"
     report_path.write_text("\n".join(lines).rstrip() + "\n")
     return report_path
@@ -360,7 +402,7 @@ def run_stage2_oracle_diagnostics(config=None):
         config=config,
         tx_basis=learned_tx,
         rx_basis=learned_rx,
-        scheme_name="LearnedNonlinearOracleEps",
+        scheme_name="OracleDiagnosticSupport",
         seed_offset=0,
         oracle_eps_conditioning=True,
     )
@@ -373,22 +415,23 @@ def run_stage2_oracle_diagnostics(config=None):
         stage_summary_df=stage_summary_df.copy(),
         stage_failed=False,
         failed_stage=None,
-        stop_reason="Completed Stage 2 oracle nonlinear receiver diagnostics.",
+        stop_reason="Completed Stage 2 oracle MMSE scale diagnostics.",
     )
 
-    schemes = _build_oracle_schemes(config, learned_tx, learned_rx, learned_stage2.receiver.eval())
+    schemes = _build_oracle_schemes(config, learned_tx, learned_rx)
     result = run_final_evaluation(config, training_result, schemes=schemes)
     result.artifact_paths["stage1_checkpoint_snapshot"] = checkpoint_snapshot_path
+    _rerender_collapsed_geometry_plots(config, result, schemes)
 
-    sensitivity_df = _build_oracle_alpha_sensitivity(config, learned_tx, learned_rx, result.ber_df)
-    sensitivity_path = config.output_dir / "oracle_alpha_sensitivity.csv"
+    sensitivity_df = _build_oracle_scale_sensitivity(result.ber_df)
+    sensitivity_path = config.output_dir / "oracle_mmse_scale_sensitivity.csv"
     sensitivity_df.to_csv(sensitivity_path, index=False)
-    result.artifact_paths["oracle_alpha_sensitivity_csv"] = sensitivity_path
+    result.artifact_paths["oracle_mmse_scale_sensitivity_csv"] = sensitivity_path
 
     comparison_plot = plot_ber_curve_multi(
         ber_df=result.ber_df,
         method_order=ORACLE_METHOD_ORDER,
-        title=f"Oracle diagnosis BER vs residual CFO | {config.modulation}, N={config.N}, M={config.M}",
+        title=f"Oracle MMSE sensitivity BER vs residual CFO | {config.modulation}, N={config.N}, M={config.M}",
         path=config.output_dir / "oracle_ber_comparison.png",
     )
     if comparison_plot is not None:
@@ -402,9 +445,6 @@ def run_stage2_oracle_diagnostics(config=None):
         result=result,
         sensitivity_df=sensitivity_df,
         output_dir=config.output_dir,
-        comparison_plot=comparison_plot if comparison_plot is not None else config.output_dir / "oracle_ber_comparison.png",
-        gain_plot=gain_plot,
-        constellation_plot=constellation_plot,
     )
     result.artifact_paths["report_md"] = report_path
     print(f"Wrote oracle report -> {report_path}", flush=True)
