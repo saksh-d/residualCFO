@@ -13,3 +13,6 @@ DS_store/
 
 # Ignore Python cache directories
 __pycache__/
+
+#Local files for tracking and planning
+planning/
