@@ -221,6 +221,42 @@ def transmitter_plot_method_order(
     return order + extras
 
 
+def _usrnet_stage1_methods(methods: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    available = list(methods)
+    return [method for method in ("OFDM", "Learned") if method in available]
+
+
+def _extract_markdown_section(markdown_text: str, header: str) -> str | None:
+    lines = markdown_text.splitlines()
+    header_line = f"## {header}"
+    start_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip() == header_line:
+            start_idx = idx + 1
+            break
+    if start_idx is None:
+        return None
+    end_idx = len(lines)
+    for idx in range(start_idx, len(lines)):
+        if lines[idx].startswith("## "):
+            end_idx = idx
+            break
+    body = "\n".join(lines[start_idx:end_idx]).strip()
+    return body or None
+
+
+def _load_stage1_run_summary_markdown(config: ExperimentConfig) -> str | None:
+    checkpoint_path = config.stage2_checkpoint_source_path or config.stage2_checkpoint_path
+    if checkpoint_path is None:
+        return None
+    checkpoint_dir = Path(checkpoint_path).resolve().parent
+    for report_name in ("report.md", "report.MD"):
+        report_path = checkpoint_dir / report_name
+        if report_path.exists():
+            return _extract_markdown_section(report_path.read_text(), "Run Summary")
+    return None
+
+
 def average_metrics_by_abs_cfo(ber_df: pd.DataFrame) -> pd.DataFrame:
     if ber_df.empty:
         return ber_df.copy()
@@ -1696,6 +1732,8 @@ def plot_ber_curve(
     )
     plt.xlabel("Absolute residual CFO" if config.stage2_enabled else "Normalized residual CFO")
     plt.ylabel("BER")
+    if config.stage2_enabled and len(config.ber_eval_cfo) > 0:
+        plt.xlim(0.0, float(np.max(np.abs(np.asarray(config.ber_eval_cfo, dtype=float)))))
     plt.grid(True, which="both", alpha=0.3)
     plt.legend()
     path = config.output_dir / "ber_vs_cfo.png"
@@ -1718,6 +1756,10 @@ def plot_ber_curve(
         )
         plt.xlabel("Normalized residual CFO")
         plt.ylabel("BER")
+        if len(config.ber_eval_cfo) > 0:
+            signed_min = float(np.min(np.asarray(config.ber_eval_cfo, dtype=float)))
+            signed_max = float(np.max(np.asarray(config.ber_eval_cfo, dtype=float)))
+            plt.xlim(signed_min, signed_max)
         plt.grid(True, which="both", alpha=0.3)
         plt.legend()
         signed_fig.savefig(config.output_dir / "ber_vs_cfo_signed.png", bbox_inches="tight")
@@ -1788,6 +1830,7 @@ def plot_ber_vs_snr_by_cfo(
         ax.set_title(rf"$\delta = {eps:.2f}$")
         ax.set_xlabel("Eb/N0 [dB]")
         ax.set_ylabel("BER")
+        ax.set_ylim(bottom=1.0e-4)
         ax.grid(True, which="both", alpha=0.3)
     axes[0][0].legend()
     fig.suptitle(
@@ -1847,6 +1890,8 @@ def plot_constellation_snapshots(
     if constellation_df.empty:
         return None
     cfo_values = [float(eps) for eps in sorted(constellation_df["eps"].unique())]
+    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
+        preferred_order = ("OFDM", "Learned", "OFDMUSRNet", "LearnedUSRNet")
     method_names = ordered_methods(constellation_df["method"].unique().tolist(), preferred_order)
     fig, axes = plt.subplots(
         len(method_names),
@@ -1940,6 +1985,8 @@ def plot_time_domain_waveform(
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
     method_names = transmitter_plot_method_order(schemes, preferred_order)
+    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
+        method_names = _usrnet_stage1_methods(method_names)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -1968,6 +2015,8 @@ def plot_time_domain_envelope_phase(
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
     method_names = transmitter_plot_method_order(schemes, preferred_order)
+    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
+        method_names = _usrnet_stage1_methods(method_names)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -1995,6 +2044,10 @@ def plot_papr_ccdf(
 ) -> Path | None:
     if papr_df.empty:
         return None
+    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
+        papr_df = papr_df[papr_df["method"].isin(_usrnet_stage1_methods(papr_df["method"].unique().tolist()))]
+        if papr_df.empty:
+            return None
     fig = plt.figure(figsize=(7.6, 4.4), dpi=130)
     for method in ordered_methods(papr_df["method"].unique().tolist(), preferred_order):
         values = np.sort(papr_df[papr_df["method"] == method]["papr_db"].to_numpy())
@@ -2028,6 +2081,12 @@ def plot_spectral_fairness(
 ) -> Path | None:
     if spectral_df.empty:
         return None
+    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
+        keep_methods = _usrnet_stage1_methods(spectral_df["method"].unique().tolist())
+        spectral_df = spectral_df[spectral_df["method"].isin(keep_methods)]
+        papr_df = papr_df[papr_df["method"].isin(keep_methods)]
+        if spectral_df.empty:
+            return None
     fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.4), dpi=130, constrained_layout=True)
 
     nominal_width = config.payload_bin_count if config.frame_structure_enabled else config.N
@@ -2176,6 +2235,63 @@ def build_summary_markdown(
     preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     if config.stage2_enabled:
+        if config.stage2_workflow == "USR_NET":
+            available_methods = set(summary_df["method"].astype(str).tolist())
+            required_usrnet = {"OFDM", "OFDMUSRNet", "Learned", "LearnedUSRNet"}
+            if required_usrnet.issubset(available_methods):
+                stage1_summary = _load_stage1_run_summary_markdown(config)
+                ofdm = summary_df[summary_df["method"] == "OFDM"].iloc[0]
+                ofdm_usr = summary_df[summary_df["method"] == "OFDMUSRNet"].iloc[0]
+                learned = summary_df[summary_df["method"] == "Learned"].iloc[0]
+                learned_usr = summary_df[summary_df["method"] == "LearnedUSRNet"].iloc[0]
+                lines: list[str] = []
+                if stage1_summary:
+                    lines.append(stage1_summary)
+                    lines.append("")
+                lines.append("**USR-Net Stage 2 Summary**")
+                lines.append(
+                    f"- Stage 1 checkpoint source: `{config.stage2_checkpoint_source_path or config.stage2_checkpoint_path}`."
+                )
+                lines.append(
+                    f"- Stage 1 checkpoint snapshot: `{config.stage2_checkpoint_snapshot_path}`, "
+                    f"format `{config.stage2_checkpoint_format}`, payload hash `{config.stage2_checkpoint_hash_sha256}`, "
+                    f"file hash `{config.stage2_checkpoint_file_sha256}`, acceptance `{config.stage2_checkpoint_acceptance_passed}`."
+                )
+                lines.append(
+                    f"- Stage 2 training status: `{training_result.stop_reason}`."
+                )
+                for _, row in stage_summary_df.iterrows():
+                    best_epoch = int(row.get("best_stage_epoch", row["best_global_epoch"]))
+                    lines.append(
+                        f"- {row['scheme']} {row['stage']}: best epoch `{best_epoch}`, val BER `{row['val_ber']:.4e}`, "
+                        f"hard-CFO BER `{row['hard_cfo_weighted_ber']:.4e}`, guard `{row['guard_loss']:.4e}`."
+                    )
+                lines.append(
+                    f"- BER at CFO `0.00`: OFDM `{ofdm['ber_at_0']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0']:.3e}`, "
+                    f"Learned `{learned['ber_at_0']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0']:.3e}`."
+                )
+                lines.append(
+                    f"- BER at CFO `0.05`: OFDM `{ofdm['ber_at_0p05']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0p05']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p05']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0p05']:.3e}`."
+                )
+                lines.append(
+                    f"- BER at CFO `0.10`: OFDM `{ofdm['ber_at_0p10']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0p10']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p10']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0p10']:.3e}`."
+                )
+                lines.append(
+                    f"- EVM at CFO `0.10`: OFDM `{ofdm['evm_at_0p10']:.4f}`, OFDM + USR-Net `{ofdm_usr['evm_at_0p10']:.4f}`, "
+                    f"Learned `{learned['evm_at_0p10']:.4f}`, Learned + USR-Net `{learned_usr['evm_at_0p10']:.4f}`."
+                )
+                lines.append(
+                    f"- Robustness window BER <= `0.01`: OFDM `{ofdm['robust_window_ber_le_0.01']:.3f}`, OFDM + USR-Net `{ofdm_usr['robust_window_ber_le_0.01']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.01']:.3f}`, Learned + USR-Net `{learned_usr['robust_window_ber_le_0.01']:.3f}`."
+                )
+                lines.append(
+                    f"- Robustness window BER <= `0.1`: OFDM `{ofdm['robust_window_ber_le_0.1']:.3f}`, OFDM + USR-Net `{ofdm_usr['robust_window_ber_le_0.1']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.1']:.3f}`, Learned + USR-Net `{learned_usr['robust_window_ber_le_0.1']:.3f}`."
+                )
+                return "\n".join(lines)
+
         available_methods = set(summary_df["method"].astype(str).tolist())
         required_four_way = {"OFDM", "OFDMNonlinear", "Learned", "LearnedNonlinear"}
         if not required_four_way.issubset(available_methods):

@@ -60,6 +60,93 @@ class Stage2ReceiverTrainingResult:
     stage_summary_df: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class CoreReferenceModelConfig:
+    rho_init: float = 0.90
+    gamma_init: float = 1.0
+    final_gain_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class USRNetArchitectureConfig:
+    num_layers: int = 3
+    feature_channels: int = 10
+    conv_hidden_channels: int = 64
+    conv_kernel_size: int = 3
+    conv_dilations: tuple[int, ...] = (1, 2, 4)
+    final_gain_enabled: bool = True
+    rho_init: tuple[float, ...] = (0.85, 0.90, 0.95)
+    gamma_init: tuple[float, ...] = (1.0, 1.0, 1.0)
+    alpha_init: tuple[float, ...] = (0.03, 0.05, 0.05)
+
+    def __post_init__(self) -> None:
+        if self.num_layers < 1:
+            raise ValueError("USR-Net must have at least one unfolded layer.")
+        if self.feature_channels != 10:
+            raise ValueError("USR-Net currently expects exactly 10 real feature channels.")
+        if self.conv_kernel_size < 1 or self.conv_kernel_size % 2 == 0:
+            raise ValueError("conv_kernel_size must be a positive odd integer.")
+        if len(self.conv_dilations) != 3:
+            raise ValueError("USR-Net currently expects exactly three dilated Conv1d layers.")
+        if len(self.rho_init) != self.num_layers:
+            raise ValueError("rho_init must match num_layers.")
+        if len(self.gamma_init) != self.num_layers:
+            raise ValueError("gamma_init must match num_layers.")
+        if len(self.alpha_init) != self.num_layers:
+            raise ValueError("alpha_init must match num_layers.")
+
+
+@dataclass(frozen=True)
+class USRNetLossConfig:
+    layer_weights: tuple[float, ...] = (0.2, 0.3, 0.5)
+    temp_cls: float = 0.1
+    cls_weight: float = 0.3
+    identity_weight: float = 0.1
+    correction_weight: float = 1.0e-4
+    guard_weight: float = 0.5
+
+
+@dataclass(frozen=True)
+class USRNetCoreTrainingConfig:
+    epochs: int = 50
+    batch_size: int = 512
+    learning_rate: float = 1.0e-3
+    delta_span: float = 0.15
+    ebn0_choices: tuple[float, ...] = (10.0, 12.0, 15.0, 20.0)
+    sigma_condition: float = 0.005
+
+
+@dataclass(frozen=True)
+class USRNetPhaseConfig:
+    name: str
+    epochs: int
+    learning_rate: float
+    sigma_condition: float | tuple[float, ...]
+    delta_span: float
+    ebn0_choices: tuple[float, ...]
+    disable_neural: bool
+    train_conv: bool
+    train_alpha: bool
+
+
+@dataclass(frozen=True)
+class USRNetValidationConfig:
+    delta_values: tuple[float, ...] = (0.0, 0.05, 0.10, -0.05, -0.10)
+    sigma_condition: float = 0.005
+    batch_size: int = 256
+    ebn0_choices: tuple[float, ...] = (10.0, 12.0, 15.0, 20.0)
+
+
+@dataclass(frozen=True)
+class USRNetConditioningConfig:
+    default_sigma_condition: float = 0.005
+    sensitivity_sigmas: tuple[float, ...] = (0.0, 0.0025, 0.0050, 0.0100, 0.0200, 0.0300, 0.0500)
+    phi_sign_default: int = 1
+    sign_probe_delta: float = 0.10
+    sign_probe_ebn0_db: float = 20.0
+    sign_probe_batch_size: int = 256
+
+
 def _progress_enabled(config: ExperimentConfig) -> bool:
     return bool(getattr(config, "terminal_progress_enabled", True))
 
@@ -2318,14 +2405,17 @@ class DiagonalCoreReference(nn.Module):
         *,
         phi_sign: int = DEFAULT_PHI_SIGN,
         eval_condition_sigma: float = DEFAULT_SIGMA_CONDITION,
+        model_config: CoreReferenceModelConfig | None = None,
     ) -> None:
         super().__init__()
+        model_config = CoreReferenceModelConfig() if model_config is None else model_config
         self.register_buffer("W_tx", W_tx.detach().clone().to(torch.complex64))
         self.register_buffer("V", V.detach().clone().to(torch.complex64))
         self.phi_sign = int(phi_sign)
         self.eval_condition_sigma = float(eval_condition_sigma)
-        self.raw_rho = nn.Parameter(torch.tensor(_raw_rho_from_target(0.90), dtype=torch.float32))
-        self.raw_gamma = nn.Parameter(torch.tensor(_inverse_softplus(1.0), dtype=torch.float32))
+        self.final_gain_enabled = bool(model_config.final_gain_enabled)
+        self.raw_rho = nn.Parameter(torch.tensor(_raw_rho_from_target(model_config.rho_init), dtype=torch.float32))
+        self.raw_gamma = nn.Parameter(torch.tensor(_inverse_softplus(model_config.gamma_init), dtype=torch.float32))
         self.final_gain_re = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.final_gain_im = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
@@ -2338,6 +2428,8 @@ class DiagonalCoreReference(nn.Module):
         }
 
     def _gain(self) -> torch.Tensor:
+        if not self.final_gain_enabled:
+            return torch.ones((), device=self.final_gain_re.device, dtype=torch.complex64)
         return _complex_gain(self.final_gain_re, self.final_gain_im)
 
     def forward_refine(
@@ -2392,17 +2484,24 @@ class DiagonalCoreReference(nn.Module):
 
 
 class _DilatedResidualBlock(nn.Module):
-    def __init__(self, in_channels: int = 10, hidden_channels: int = 64) -> None:
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        dilations: tuple[int, ...],
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels, hidden_channels, kernel_size=3, dilation=1, padding=1),
-            nn.GELU(),
-            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=2, padding=2),
-            nn.GELU(),
-            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=4, padding=4),
-            nn.GELU(),
-            nn.Conv1d(hidden_channels, 2, kernel_size=1),
-        )
+        layers: list[nn.Module] = []
+        current_in = in_channels
+        for dilation in dilations:
+            padding = dilation * (kernel_size // 2)
+            layers.append(nn.Conv1d(current_in, hidden_channels, kernel_size=kernel_size, dilation=dilation, padding=padding))
+            layers.append(nn.GELU())
+            current_in = hidden_channels
+        layers.append(nn.Conv1d(hidden_channels, 2, kernel_size=1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.net(features)
@@ -2417,32 +2516,40 @@ class UnfoldedSymbolRefiner(nn.Module):
         phi_sign: int = DEFAULT_PHI_SIGN,
         num_layers: int = 3,
         eval_condition_sigma: float = DEFAULT_SIGMA_CONDITION,
+        architecture_config: USRNetArchitectureConfig | None = None,
     ) -> None:
         super().__init__()
+        architecture_config = USRNetArchitectureConfig(num_layers=num_layers) if architecture_config is None else architecture_config
         self.register_buffer("W_tx", W_tx.detach().clone().to(torch.complex64))
         self.register_buffer("V", V.detach().clone().to(torch.complex64))
         self.phi_sign = int(phi_sign)
-        self.num_layers = int(num_layers)
+        self.num_layers = int(architecture_config.num_layers)
         self.eval_condition_sigma = float(eval_condition_sigma)
-        rho_init = [0.85, 0.90, 0.95]
-        gamma_init = [1.0, 1.0, 1.0]
-        alpha_init = [0.03, 0.05, 0.05]
+        self.final_gain_enabled = bool(architecture_config.final_gain_enabled)
         self.raw_rho_t = nn.Parameter(
-            torch.tensor([_raw_rho_from_target(value) for value in rho_init[: self.num_layers]], dtype=torch.float32)
+            torch.tensor([_raw_rho_from_target(value) for value in architecture_config.rho_init], dtype=torch.float32)
         )
         self.raw_gamma_t = nn.Parameter(
-            torch.tensor([_inverse_softplus(value) for value in gamma_init[: self.num_layers]], dtype=torch.float32)
+            torch.tensor([_inverse_softplus(value) for value in architecture_config.gamma_init], dtype=torch.float32)
         )
         self.raw_alpha_t = nn.Parameter(
             torch.tensor(
                 [
                     _inverse_sigmoid(min(max(value / 0.2, 1.0e-4), 1.0 - 1.0e-4))
-                    for value in alpha_init[: self.num_layers]
+                    for value in architecture_config.alpha_init
                 ],
                 dtype=torch.float32,
             )
         )
-        self.blocks = nn.ModuleList(_DilatedResidualBlock(in_channels=10, hidden_channels=64) for _ in range(self.num_layers))
+        self.blocks = nn.ModuleList(
+            _DilatedResidualBlock(
+                in_channels=architecture_config.feature_channels,
+                hidden_channels=architecture_config.conv_hidden_channels,
+                kernel_size=architecture_config.conv_kernel_size,
+                dilations=architecture_config.conv_dilations,
+            )
+            for _ in range(self.num_layers)
+        )
         self.final_gain_re = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.final_gain_im = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
@@ -2456,6 +2563,8 @@ class UnfoldedSymbolRefiner(nn.Module):
         }
 
     def _gain(self) -> torch.Tensor:
+        if not self.final_gain_enabled:
+            return torch.ones((), device=self.final_gain_re.device, dtype=torch.complex64)
         return _complex_gain(self.final_gain_re, self.final_gain_im)
 
     def _build_features(
@@ -2611,29 +2720,29 @@ def _evaluate_validation_grid(
     V: torch.Tensor,
     receiver: UnfoldedSymbolRefiner | DiagonalCoreReference,
     *,
-    sigma_condition: float,
+    validation_config: USRNetValidationConfig,
     seed: int,
 ) -> dict[str, float]:
     set_seed(seed)
     ber_rows: list[float] = []
     total_loss = 0.0
     total_guard = 0.0
-    for delta_value in (0.0, 0.05, 0.10, -0.05, -0.10):
+    for delta_value in validation_config.delta_values:
         batch = _sample_training_batch(
             config,
             W_tx,
             V,
-            batch_size=min(config.ber_batch_size, 256),
+            batch_size=min(config.ber_batch_size, int(validation_config.batch_size)),
             delta_span=abs(delta_value) if abs(delta_value) > 0.0 else 0.001,
-            ebn0_choices=DEFAULT_EBN0_CHOICES,
-            sigma_condition=sigma_condition,
+            ebn0_choices=validation_config.ebn0_choices,
+            sigma_condition=validation_config.sigma_condition,
         )
         if abs(delta_value) > 0.0:
             batch["delta_true"] = torch.full_like(batch["delta_true"], float(delta_value))
             x = transmit_symbols(batch["true_symbols"], W_tx)
             y, _ = propagate(x, batch["delta_true"], config, ebn0_db=batch["ebn0_values"])
             batch["z0"] = decode_symbols(y, V)
-            batch["delta_condition"] = batch["delta_true"] + float(sigma_condition) * torch.randn_like(batch["delta_true"])
+            batch["delta_condition"] = batch["delta_true"] + float(validation_config.sigma_condition) * torch.randn_like(batch["delta_true"])
 
         with torch.no_grad():
             if isinstance(receiver, UnfoldedSymbolRefiner):
@@ -2662,11 +2771,13 @@ def _evaluate_validation_grid(
 def _core_reference_loss(
     receiver: DiagonalCoreReference,
     batch: dict[str, torch.Tensor],
+    *,
+    loss_config: USRNetLossConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     corrected, aux = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
     labels = qam16_labels_from_bits(batch["true_bits"]).reshape(-1)
     L_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
-    logits = _constellation_logits(corrected)
+    logits = _constellation_logits(corrected, temp_cls=loss_config.temp_cls)
     L_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels)
     identity_mask = torch.abs(batch["delta_true"]) < 0.02
     if torch.any(identity_mask):
@@ -2674,7 +2785,12 @@ def _core_reference_loss(
     else:
         L_id = torch.zeros((), device=corrected.device, dtype=torch.float32)
     L_corr = _correction_norm(corrected, batch["z0"])
-    loss = L_mse + 0.3 * L_cls + 0.1 * L_id + 1.0e-4 * L_corr
+    loss = (
+        L_mse
+        + float(loss_config.cls_weight) * L_cls
+        + float(loss_config.identity_weight) * L_id
+        + float(loss_config.correction_weight) * L_corr
+    )
     metrics = {
         "train_total": float(loss.item()),
         "train_Lmse": float(L_mse.item()),
@@ -2693,6 +2809,7 @@ def _usrnet_loss(
     batch: dict[str, torch.Tensor],
     *,
     disable_neural: bool,
+    loss_config: USRNetLossConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     corrected, aux = receiver.forward_refine(
         batch["z0"],
@@ -2703,10 +2820,10 @@ def _usrnet_loss(
     with torch.no_grad():
         r_core, _ = core_reference.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
     iterates = list(aux["iterates"])
-    weights = list(DEFAULT_LAYER_WEIGHTS[: len(iterates)])
+    weights = list(loss_config.layer_weights[: len(iterates)])
     L_sym = sum(weight * _normalized_batch_mse(est, batch["true_symbols"]) for weight, est in zip(weights, iterates))
     labels = qam16_labels_from_bits(batch["true_bits"]).reshape(-1)
-    logits = _constellation_logits(corrected)
+    logits = _constellation_logits(corrected, temp_cls=loss_config.temp_cls)
     L_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels)
     identity_mask = torch.abs(batch["delta_true"]) < 0.02
     if torch.any(identity_mask):
@@ -2717,7 +2834,13 @@ def _usrnet_loss(
     core_mse = _normalized_batch_mse(r_core, batch["true_symbols"])
     net_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
     L_guard = torch.relu(net_mse - core_mse) ** 2
-    loss = L_sym + 0.3 * L_cls + 0.1 * L_id + 1.0e-4 * L_corr + 0.5 * L_guard
+    loss = (
+        L_sym
+        + float(loss_config.cls_weight) * L_cls
+        + float(loss_config.identity_weight) * L_id
+        + float(loss_config.correction_weight) * L_corr
+        + float(loss_config.guard_weight) * L_guard
+    )
     alpha_values = receiver.parameter_summary()["alpha_t"]
     metrics = {
         "train_total": float(loss.item()),
@@ -2740,14 +2863,28 @@ def train_diagonal_core_reference(
     *,
     scheme_name: str,
     phi_sign: int,
+    model_config: CoreReferenceModelConfig | None = None,
+    train_config: USRNetCoreTrainingConfig | None = None,
+    validation_config: USRNetValidationConfig | None = None,
+    loss_config: USRNetLossConfig | None = None,
     smoke_mode: bool = False,
     seed_offset: int = 0,
 ) -> CoreReferenceTrainingBundle:
     set_seed(config.base_seed + 11_000 + int(seed_offset))
-    receiver = DiagonalCoreReference(W_tx, V, phi_sign=phi_sign, eval_condition_sigma=DEFAULT_SIGMA_CONDITION).to(config.device)
-    epochs = 5 if smoke_mode else 50
-    batch_size = 256 if smoke_mode else 512
-    optimizer = torch.optim.Adam(receiver.parameters(), lr=1.0e-3)
+    model_config = CoreReferenceModelConfig() if model_config is None else model_config
+    train_config = USRNetCoreTrainingConfig() if train_config is None else train_config
+    validation_config = USRNetValidationConfig() if validation_config is None else validation_config
+    loss_config = USRNetLossConfig() if loss_config is None else loss_config
+    receiver = DiagonalCoreReference(
+        W_tx,
+        V,
+        phi_sign=phi_sign,
+        eval_condition_sigma=float(train_config.sigma_condition),
+        model_config=model_config,
+    ).to(config.device)
+    epochs = int(train_config.epochs)
+    batch_size = int(train_config.batch_size)
+    optimizer = torch.optim.Adam(receiver.parameters(), lr=float(train_config.learning_rate))
     history_rows: list[dict[str, object]] = []
     best_row: dict[str, object] | None = None
     best_val_total = float("inf")
@@ -2759,15 +2896,22 @@ def train_diagonal_core_reference(
             W_tx,
             V,
             batch_size=batch_size,
-            delta_span=0.15,
-            ebn0_choices=DEFAULT_EBN0_CHOICES,
-            sigma_condition=DEFAULT_SIGMA_CONDITION,
+            delta_span=float(train_config.delta_span),
+            ebn0_choices=train_config.ebn0_choices,
+            sigma_condition=float(train_config.sigma_condition),
         )
         optimizer.zero_grad(set_to_none=True)
-        loss, metrics = _core_reference_loss(receiver, batch)
+        loss, metrics = _core_reference_loss(receiver, batch, loss_config=loss_config)
         loss.backward()
         optimizer.step()
-        val_metrics = _evaluate_validation_grid(config, W_tx, V, receiver, sigma_condition=DEFAULT_SIGMA_CONDITION, seed=config.base_seed + 20_000 + epoch_idx)
+        val_metrics = _evaluate_validation_grid(
+            config,
+            W_tx,
+            V,
+            receiver,
+            validation_config=validation_config,
+            seed=config.base_seed + 20_000 + epoch_idx,
+        )
         row = {
             "scheme": scheme_name,
             "global_epoch": epoch_idx + 1,
@@ -2819,11 +2963,26 @@ def train_usrnet_receiver(
     *,
     scheme_name: str,
     phi_sign: int,
+    architecture_config: USRNetArchitectureConfig | None = None,
+    phase_configs: tuple[USRNetPhaseConfig, ...] | None = None,
+    validation_config: USRNetValidationConfig | None = None,
+    loss_config: USRNetLossConfig | None = None,
+    conditioning_config: USRNetConditioningConfig | None = None,
     smoke_mode: bool = False,
     seed_offset: int = 0,
 ) -> USRNetTrainingBundle:
     set_seed(config.base_seed + 31_000 + int(seed_offset))
-    receiver = UnfoldedSymbolRefiner(W_tx, V, phi_sign=phi_sign, eval_condition_sigma=DEFAULT_SIGMA_CONDITION).to(config.device)
+    architecture_config = USRNetArchitectureConfig() if architecture_config is None else architecture_config
+    validation_config = USRNetValidationConfig() if validation_config is None else validation_config
+    loss_config = USRNetLossConfig() if loss_config is None else loss_config
+    conditioning_config = USRNetConditioningConfig() if conditioning_config is None else conditioning_config
+    receiver = UnfoldedSymbolRefiner(
+        W_tx,
+        V,
+        phi_sign=phi_sign,
+        eval_condition_sigma=float(conditioning_config.default_sigma_condition),
+        architecture_config=architecture_config,
+    ).to(config.device)
     core_params = core_reference.parameter_summary()
     with torch.no_grad():
         receiver.raw_gamma_t.fill_(_inverse_softplus(float(core_params["gamma"])))
@@ -2831,45 +2990,51 @@ def train_usrnet_receiver(
         receiver.final_gain_re.fill_(float(core_params["final_gain_re"]))
         receiver.final_gain_im.fill_(float(core_params["final_gain_im"]))
 
-    phase_specs = [
-        {
-            "name": "Phase0CoreMatch",
-            "epochs": 5 if smoke_mode else 50,
-            "learning_rate": 1.0e-3,
-            "sigma_condition": DEFAULT_SIGMA_CONDITION,
-            "disable_neural": True,
-            "train_conv": False,
-            "train_alpha": False,
-        },
-        {
-            "name": "Phase1NeuralUnfreeze",
-            "epochs": 5 if smoke_mode else 150,
-            "learning_rate": 5.0e-4,
-            "sigma_condition": DEFAULT_SIGMA_CONDITION,
-            "disable_neural": False,
-            "train_conv": True,
-            "train_alpha": True,
-        },
-        {
-            "name": "Phase2Robustness",
-            "epochs": 5 if smoke_mode else 100,
-            "learning_rate": 2.0e-4,
-            "sigma_condition": (0.0, 0.0025, 0.0050, 0.0100, 0.0200),
-            "disable_neural": False,
-            "train_conv": True,
-            "train_alpha": True,
-        },
-    ]
+    if phase_configs is None:
+        phase_configs = (
+            USRNetPhaseConfig(
+                name="Phase0CoreMatch",
+                epochs=50,
+                learning_rate=1.0e-3,
+                sigma_condition=float(conditioning_config.default_sigma_condition),
+                delta_span=0.15,
+                ebn0_choices=DEFAULT_EBN0_CHOICES,
+                disable_neural=True,
+                train_conv=False,
+                train_alpha=False,
+            ),
+            USRNetPhaseConfig(
+                name="Phase1NeuralUnfreeze",
+                epochs=150,
+                learning_rate=5.0e-4,
+                sigma_condition=float(conditioning_config.default_sigma_condition),
+                delta_span=0.15,
+                ebn0_choices=DEFAULT_EBN0_CHOICES,
+                disable_neural=False,
+                train_conv=True,
+                train_alpha=True,
+            ),
+            USRNetPhaseConfig(
+                name="Phase2Robustness",
+                epochs=100,
+                learning_rate=2.0e-4,
+                sigma_condition=(0.0, 0.0025, 0.0050, 0.0100, 0.0200),
+                delta_span=0.15,
+                ebn0_choices=DEFAULT_EBN0_CHOICES,
+                disable_neural=False,
+                train_conv=True,
+                train_alpha=True,
+            ),
+        )
 
     history_rows: list[dict[str, object]] = []
     stage_rows: list[dict[str, object]] = []
     global_epoch = 0
-    batch_size = 256 if smoke_mode else 512
 
-    for phase_idx, phase in enumerate(phase_specs):
+    for phase_idx, phase in enumerate(phase_configs):
         for parameter in receiver.blocks.parameters():
-            parameter.requires_grad = bool(phase["train_conv"])
-        receiver.raw_alpha_t.requires_grad = bool(phase["train_alpha"])
+            parameter.requires_grad = bool(phase.train_conv)
+        receiver.raw_alpha_t.requires_grad = bool(phase.train_alpha)
         receiver.raw_gamma_t.requires_grad = True
         receiver.raw_rho_t.requires_grad = True
         receiver.final_gain_re.requires_grad = True
@@ -2877,29 +3042,30 @@ def train_usrnet_receiver(
 
         optimizer = torch.optim.Adam(
             [parameter for parameter in receiver.parameters() if parameter.requires_grad],
-            lr=float(phase["learning_rate"]),
+            lr=float(phase.learning_rate),
         )
         best_val_total = float("inf")
         best_row: dict[str, object] | None = None
         phase_start = perf_counter()
-        epochs = int(phase["epochs"])
+        epochs = int(phase.epochs)
         for epoch_idx in range(epochs):
             receiver.train()
             batch = _sample_training_batch(
                 config,
                 W_tx,
                 V,
-                batch_size=batch_size,
-                delta_span=0.15,
-                ebn0_choices=DEFAULT_EBN0_CHOICES,
-                sigma_condition=phase["sigma_condition"],
+                batch_size=int(config.train_symbol_batch_size),
+                delta_span=float(phase.delta_span),
+                ebn0_choices=phase.ebn0_choices,
+                sigma_condition=phase.sigma_condition,
             )
             optimizer.zero_grad(set_to_none=True)
             loss, metrics = _usrnet_loss(
                 receiver,
                 core_reference,
                 batch,
-                disable_neural=bool(phase["disable_neural"]),
+                disable_neural=bool(phase.disable_neural),
+                loss_config=loss_config,
             )
             loss.backward()
             optimizer.step()
@@ -2909,7 +3075,7 @@ def train_usrnet_receiver(
                 W_tx,
                 V,
                 receiver,
-                sigma_condition=DEFAULT_SIGMA_CONDITION,
+                validation_config=validation_config,
                 seed=config.base_seed + 40_000 + 1_000 * phase_idx + epoch_idx,
             )
             params = receiver.parameter_summary()
@@ -2926,7 +3092,7 @@ def train_usrnet_receiver(
                     "val_total": val_metrics["val_total"],
                     "val_ber": val_metrics["val_ber"],
                     "residual_scale": metrics["residual_scale"],
-                    "phase": phase["name"],
+                    "phase": phase.name,
                     "rho_t": repr(params["rho_t"]),
                     "gamma_t": repr(params["gamma_t"]),
                     "alpha_t": repr(params["alpha_t"]),
@@ -2936,7 +3102,7 @@ def train_usrnet_receiver(
                 best_val_total = val_metrics["val_total"]
                 best_row = {
                     "scheme": scheme_name,
-                    "stage": phase["name"],
+                    "stage": phase.name,
                     "best_global_epoch": global_epoch,
                     "best_stage_epoch": epoch_idx + 1,
                     "val_total": val_metrics["val_total"],
@@ -2953,12 +3119,12 @@ def train_usrnet_receiver(
             if epoch_idx in {0, epochs - 1} or (epochs >= 20 and (epoch_idx + 1) % 25 == 0):
                 log_terminal_progress(
                     config,
-                    f"[USRNet] {scheme_name} {phase['name']} epoch={epoch_idx + 1:03d}/{epochs:03d} "
+                    f"[USRNet] {scheme_name} {phase.name} epoch={epoch_idx + 1:03d}/{epochs:03d} "
                     f"train={metrics['train_total']:.4e} val={val_metrics['val_total']:.4e} "
                     f"ber={val_metrics['val_ber']:.4e} guard={metrics['guard_loss']:.4e}",
                 )
         if best_row is None:
-            raise RuntimeError(f"USR-Net phase {phase['name']} did not record a best validation row.")
+            raise RuntimeError(f"USR-Net phase {phase.name} did not record a best validation row.")
         stage_rows.append(best_row)
 
     return USRNetTrainingBundle(
@@ -2974,11 +3140,14 @@ def select_phi_sign(
     schemes: dict[str, tuple[torch.Tensor, torch.Tensor]],
     *,
     seed: int,
+    sign_probe_delta: float = 0.10,
+    sign_probe_ebn0_db: float = 20.0,
+    sign_probe_batch_size: int = 256,
 ) -> tuple[int, pd.DataFrame]:
     set_seed(seed)
     rows: list[dict[str, object]] = []
-    delta_true = 0.10
-    batch_size = min(int(config.ber_batch_size), 256)
+    delta_true = float(sign_probe_delta)
+    batch_size = min(int(config.ber_batch_size), int(sign_probe_batch_size))
     true_bits, true_symbols = random_symbols(
         batch_size=batch_size,
         N=config.N,
@@ -2990,7 +3159,7 @@ def select_phi_sign(
     delta_tensor = torch.full((batch_size,), float(delta_true), device=config.device, dtype=torch.float32)
     for scheme_name, (W_tx, V) in schemes.items():
         x = transmit_symbols(true_symbols, W_tx)
-        y, _ = propagate(x, delta_tensor, config, ebn0_db=20.0)
+        y, _ = propagate(x, delta_tensor, config, ebn0_db=float(sign_probe_ebn0_db))
         z0 = decode_symbols(y, V)
         for phi_sign in (+1, -1):
             A_hat = build_a_hat(W_tx, V, delta_tensor, phi_sign=phi_sign)
