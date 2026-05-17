@@ -53,20 +53,24 @@ METHOD_ORDER = (
 METHOD_DISPLAY_NAMES = {
     "OFDM": "Classical OFDM",
     "OFDMNonlinear": "OFDM + Stage 2",
+    "OFDMUSRNet": "OFDM + USR-Net",
     "Learned": "Learned Basis",
     "LearnedOraclePreV": "Learned + Oracle Pre-V CFO",
     "LearnedOracleMMSE": "Learned + Oracle MMSE",
     "LearnedNonlinear": "Learned + Stage 2",
+    "LearnedUSRNet": "Learned + USR-Net",
     "LearnedNonlinearOracleEps": "Learned + Stage 2 (True delta)",
     "LearnedSpectral": "Learned + Spectral Mask",
 }
 METHOD_COLORS = {
     "OFDM": "#3A5F8A",
     "OFDMNonlinear": "#79A7D3",
+    "OFDMUSRNet": "#79A7D3",
     "Learned": "#C05A2B",
     "LearnedOraclePreV": "#7E6AA2",
     "LearnedOracleMMSE": "#2D8A5F",
     "LearnedNonlinear": "#E39A5F",
+    "LearnedUSRNet": "#E39A5F",
     "LearnedNonlinearOracleEps": "#C74B50",
     "LearnedSpectral": "#2D8A5F",
 }
@@ -2076,6 +2080,20 @@ def plot_spectral_fairness(
 
 def build_mapping_markdown(config: ExperimentConfig) -> str:
     if config.stage2_enabled:
+        if getattr(config, "stage2_workflow", "").upper() == "USR_NET":
+            return "\n".join(
+                [
+                    "**USR-Net Post-V Symbol Refinement**",
+                    "",
+                    rf"$z_0 = V y,\quad \hat{{A}}(c_b) = V\Phi(c_b)W,\quad r_t = D_t(c_b)^{{-1}} z_0,\quad \hat{{s}}^{{(t+1)}} = (1-\rho_t)\hat{{s}}^{{(t)}} + \rho_t\left(r_t + \alpha_t \Delta_t\right)$",
+                    "",
+                    "- The Stage 1 linear front end remains frozen and interpretable.",
+                    "- USR-Net is a three-layer unfolded symbol refinement network with model-guided correction anchors and learned residual dilated convolutional refinement blocks.",
+                    "- The block condition `c_b` is a receiver-state condition used only to build the diagonal anchor from the fixed operator `A_hat(c_b) = V Phi(c_b) W`.",
+                    "- The main path uses only the diagonal of `A_hat(c_b)`; it does not apply off-diagonal MMSE-style cancellation in the practical receiver.",
+                    "- The learned residual branch is explicitly bounded through small `alpha_t` coefficients so the network can stay close to the stable diagonal anchor when that is optimal.",
+                ]
+            )
         if getattr(config, "stage2_sideinfo_enabled", False):
             return "\n".join(
                 [

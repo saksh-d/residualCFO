@@ -12,7 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from channel import apply_residual_cfo, effective_operator, propagate
-from comm_core import ExperimentConfig, StageSpec, TrainingResult, ebn0_to_noise_variance, normalize_columns, set_seed, stage_specs
+from comm_core import (
+    ExperimentConfig,
+    StageSpec,
+    TrainingResult,
+    ebn0_to_noise_variance,
+    log_terminal_progress,
+    normalize_columns,
+    set_seed,
+    stage_specs,
+)
 from transmitter import (
     _QAM16_DECISION_BITS,
     contiguous_band_bins_with_guard,
@@ -22,6 +31,7 @@ from transmitter import (
     pilot_reference_symbol,
     qam16_from_bits,
     qpsk_from_bits,
+    random_symbols,
     sample_training_symbols,
     transmit_symbols,
 )
@@ -1939,12 +1949,21 @@ def detect_scheme_symbols(
         oracle_eps = eps_tensor if scheme.oracle_eps_conditioning else None
         if ebn0_db is None:
             raise ValueError("Nonlinear Stage 2 inference requires the active Eb/N0 for regularization.")
-        corrected_symbols, logits, aux = scheme.nonlinear_receiver(
-            z0,
-            ebn0_db_values=ebn0_db,
-            eps_override=oracle_eps,
-            eps_true=eps_tensor,
-        )
+        try:
+            corrected_symbols, logits, aux = scheme.nonlinear_receiver(
+                z0,
+                ebn0_db_values=ebn0_db,
+                eps_override=oracle_eps,
+                eps_true=eps_tensor,
+                eval_seed=eval_seed,
+            )
+        except TypeError:
+            corrected_symbols, logits, aux = scheme.nonlinear_receiver(
+                z0,
+                ebn0_db_values=ebn0_db,
+                eps_override=oracle_eps,
+                eps_true=eps_tensor,
+            )
         if config.modulation != "16QAM":
             raise ValueError("Nonlinear receiver inference is currently implemented only for 16QAM.")
         bits_hat_full = _stage2_bits_from_outputs(corrected_symbols, config.modulation)
@@ -2176,3 +2195,949 @@ def evaluate_scheme_set(
     if progress_label:
         _log_progress(config, f"[Eval] {progress_label} complete")
     return pd.DataFrame(rows)
+
+DEFAULT_SIGMA_CONDITION = 0.005
+SIGMA_CONDITION_SENSITIVITY = (0.0, 0.0025, 0.0050, 0.0100, 0.0200, 0.0300, 0.0500)
+DEFAULT_DELTA_GRID = (0.0, 0.025, 0.05, 0.075, 0.10, 0.125, 0.15)
+DEFAULT_EBN0_CHOICES = (10.0, 12.0, 15.0, 20.0)
+DEFAULT_LAYER_WEIGHTS = (0.2, 0.3, 0.5)
+DEFAULT_TEMP_CLS = 0.1
+DEFAULT_PHI_SIGN = 1
+
+
+def build_phi_from_delta(
+    delta_condition: torch.Tensor,
+    M: int,
+    *,
+    phi_sign: int = DEFAULT_PHI_SIGN,
+    dtype: torch.dtype = torch.complex64,
+) -> torch.Tensor:
+    delta_condition = delta_condition.to(torch.float32)
+    n = torch.arange(M, device=delta_condition.device, dtype=torch.float32)
+    phase = torch.exp(1j * float(phi_sign) * 2.0 * math.pi * delta_condition[:, None] * n[None, :] / float(M))
+    return phase.to(dtype)
+
+
+def build_a_hat(
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    delta_condition: torch.Tensor,
+    *,
+    phi_sign: int = DEFAULT_PHI_SIGN,
+) -> torch.Tensor:
+    phi = build_phi_from_delta(delta_condition, W_tx.shape[0], phi_sign=phi_sign, dtype=W_tx.dtype)
+    vw = torch.einsum("nm,bm->bnm", V, phi)
+    return torch.einsum("bnm,mk->bnk", vw, W_tx)
+
+
+def operator_diagnostics_from_a_hat(A_hat: torch.Tensor) -> dict[str, float]:
+    d_hat = torch.diagonal(A_hat, dim1=-2, dim2=-1)
+    offdiag = A_hat - torch.diag_embed(d_hat)
+    total_energy = torch.sum(torch.abs(A_hat) ** 2, dim=(-2, -1)).real.clamp_min(1.0e-12)
+    offdiag_energy = torch.sum(torch.abs(offdiag) ** 2, dim=(-2, -1)).real
+    return {
+        "mean_abs_diag": float(torch.mean(torch.abs(d_hat)).item()),
+        "std_abs_diag": float(torch.std(torch.abs(d_hat), unbiased=False).item()),
+        "mean_angle_diag": float(torch.mean(torch.angle(d_hat)).item()),
+        "offdiag_energy_ratio": float(torch.mean(offdiag_energy / total_energy).item()),
+    }
+
+
+def _inverse_softplus(value: float) -> float:
+    return float(math.log(math.expm1(value)))
+
+
+def _inverse_sigmoid(probability: float) -> float:
+    probability = min(max(probability, 1.0e-6), 1.0 - 1.0e-6)
+    return float(math.log(probability / (1.0 - probability)))
+
+
+def _raw_rho_from_target(target: float) -> float:
+    normalized = (float(target) - 0.1) / 0.9
+    return _inverse_sigmoid(normalized)
+
+
+def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+    return numerator / (denominator + 1.0e-6)
+
+
+def _complex_gain(re_part: torch.Tensor, im_part: torch.Tensor) -> torch.Tensor:
+    return torch.complex(re_part, im_part).to(torch.complex64)
+
+
+def _sample_condition_noise_like(
+    reference: torch.Tensor,
+    sigma: float | torch.Tensor,
+    *,
+    eval_seed: int | None = None,
+    seed_offset: int = 0,
+) -> torch.Tensor:
+    if isinstance(sigma, torch.Tensor):
+        sigma_tensor = sigma.to(device=reference.device, dtype=torch.float32)
+    else:
+        sigma_tensor = torch.full_like(reference, float(sigma), dtype=torch.float32)
+    if eval_seed is None:
+        noise = torch.randn_like(reference, dtype=torch.float32)
+    else:
+        generator_device = reference.device if reference.is_cuda else torch.device("cpu")
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(int(eval_seed) + int(seed_offset))
+        noise = torch.randn(reference.shape, generator=generator, device=reference.device, dtype=torch.float32)
+    return sigma_tensor * noise
+
+
+def _constellation_logits(symbols: torch.Tensor, temp_cls: float = DEFAULT_TEMP_CLS) -> torch.Tensor:
+    constellation = qam16_constellation_points(symbols.device, dtype=symbols.dtype)
+    dist_sq = torch.abs(symbols[..., None] - constellation[None, None, :]) ** 2
+    return -(dist_sq.real.to(torch.float32) / float(temp_cls))
+
+
+def _normalized_batch_mse(est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    denom = torch.mean(torch.abs(ref) ** 2, dim=-1).real.clamp_min(1.0e-12)
+    numer = torch.mean(torch.abs(est - ref) ** 2, dim=-1).real
+    return torch.mean(numer / denom)
+
+
+def _normalized_reference_mse(est: torch.Tensor, ref: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+    denom = torch.mean(torch.abs(anchor) ** 2, dim=-1).real.clamp_min(1.0e-12)
+    numer = torch.mean(torch.abs(est - ref) ** 2, dim=-1).real
+    return torch.mean(numer / denom)
+
+
+def _correction_norm(est: torch.Tensor, z0: torch.Tensor) -> torch.Tensor:
+    numer = torch.linalg.vector_norm(est - z0, dim=-1)
+    denom = torch.linalg.vector_norm(z0, dim=-1).clamp_min(1.0e-12)
+    return torch.mean((numer / denom).real)
+
+
+class DiagonalCoreReference(nn.Module):
+    def __init__(
+        self,
+        W_tx: torch.Tensor,
+        V: torch.Tensor,
+        *,
+        phi_sign: int = DEFAULT_PHI_SIGN,
+        eval_condition_sigma: float = DEFAULT_SIGMA_CONDITION,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("W_tx", W_tx.detach().clone().to(torch.complex64))
+        self.register_buffer("V", V.detach().clone().to(torch.complex64))
+        self.phi_sign = int(phi_sign)
+        self.eval_condition_sigma = float(eval_condition_sigma)
+        self.raw_rho = nn.Parameter(torch.tensor(_raw_rho_from_target(0.90), dtype=torch.float32))
+        self.raw_gamma = nn.Parameter(torch.tensor(_inverse_softplus(1.0), dtype=torch.float32))
+        self.final_gain_re = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.final_gain_im = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+    def parameter_summary(self) -> dict[str, float]:
+        return {
+            "rho": float((0.1 + 0.9 * torch.sigmoid(self.raw_rho)).item()),
+            "gamma": float(F.softplus(self.raw_gamma).item()),
+            "final_gain_re": float(self.final_gain_re.item()),
+            "final_gain_im": float(self.final_gain_im.item()),
+        }
+
+    def _gain(self) -> torch.Tensor:
+        return _complex_gain(self.final_gain_re, self.final_gain_im)
+
+    def forward_refine(
+        self,
+        z0: torch.Tensor,
+        delta_condition: torch.Tensor,
+        *,
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, object]] | torch.Tensor:
+        A_hat = build_a_hat(self.W_tx, self.V, delta_condition, phi_sign=self.phi_sign)
+        d_hat = torch.diagonal(A_hat, dim1=-2, dim2=-1)
+        rho = 0.1 + 0.9 * torch.sigmoid(self.raw_rho)
+        gamma = F.softplus(self.raw_gamma)
+        denom = 1.0 + gamma * (d_hat - 1.0)
+        s_tilde = _safe_divide(z0, denom)
+        corrected = (1.0 - rho) * z0 + rho * s_tilde
+        corrected = self._gain() * corrected
+        aux = {
+            "A_hat": A_hat,
+            "diag": d_hat,
+            "iterates": [corrected],
+            "r_core": corrected,
+            "eps_hat": delta_condition,
+            "rho": float(rho.item()),
+            "gamma": float(gamma.item()),
+        }
+        return (corrected, aux) if return_aux else corrected
+
+    def forward(
+        self,
+        z0: torch.Tensor,
+        *,
+        ebn0_db_values: float | torch.Tensor | None = None,
+        eps_override: torch.Tensor | None = None,
+        eps_true: torch.Tensor | None = None,
+        eval_seed: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+        if eps_true is None and eps_override is None:
+            raise ValueError("DiagonalCoreReference requires the true residual CFO to synthesize the block condition.")
+        base_condition = eps_true if eps_true is not None else eps_override
+        assert base_condition is not None
+        delta_condition = base_condition.to(torch.float32) + _sample_condition_noise_like(
+            base_condition.to(torch.float32),
+            self.eval_condition_sigma,
+            eval_seed=eval_seed,
+            seed_offset=17,
+        )
+        corrected, aux = self.forward_refine(z0, delta_condition, return_aux=True)
+        logits = _constellation_logits(corrected)
+        aux["stage2_eps_hat_mae"] = float(torch.mean(torch.abs(delta_condition - base_condition.to(torch.float32))).item())
+        return corrected, logits, aux
+
+
+class _DilatedResidualBlock(nn.Module):
+    def __init__(self, in_channels: int = 10, hidden_channels: int = 64) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_channels, kernel_size=3, dilation=1, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=4, padding=4),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, 2, kernel_size=1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features)
+
+
+class UnfoldedSymbolRefiner(nn.Module):
+    def __init__(
+        self,
+        W_tx: torch.Tensor,
+        V: torch.Tensor,
+        *,
+        phi_sign: int = DEFAULT_PHI_SIGN,
+        num_layers: int = 3,
+        eval_condition_sigma: float = DEFAULT_SIGMA_CONDITION,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("W_tx", W_tx.detach().clone().to(torch.complex64))
+        self.register_buffer("V", V.detach().clone().to(torch.complex64))
+        self.phi_sign = int(phi_sign)
+        self.num_layers = int(num_layers)
+        self.eval_condition_sigma = float(eval_condition_sigma)
+        rho_init = [0.85, 0.90, 0.95]
+        gamma_init = [1.0, 1.0, 1.0]
+        alpha_init = [0.03, 0.05, 0.05]
+        self.raw_rho_t = nn.Parameter(
+            torch.tensor([_raw_rho_from_target(value) for value in rho_init[: self.num_layers]], dtype=torch.float32)
+        )
+        self.raw_gamma_t = nn.Parameter(
+            torch.tensor([_inverse_softplus(value) for value in gamma_init[: self.num_layers]], dtype=torch.float32)
+        )
+        self.raw_alpha_t = nn.Parameter(
+            torch.tensor(
+                [
+                    _inverse_sigmoid(min(max(value / 0.2, 1.0e-4), 1.0 - 1.0e-4))
+                    for value in alpha_init[: self.num_layers]
+                ],
+                dtype=torch.float32,
+            )
+        )
+        self.blocks = nn.ModuleList(_DilatedResidualBlock(in_channels=10, hidden_channels=64) for _ in range(self.num_layers))
+        self.final_gain_re = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.final_gain_im = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+    def parameter_summary(self) -> dict[str, object]:
+        return {
+            "rho_t": [float(value) for value in (0.1 + 0.9 * torch.sigmoid(self.raw_rho_t)).detach().cpu().tolist()],
+            "gamma_t": [float(value) for value in F.softplus(self.raw_gamma_t).detach().cpu().tolist()],
+            "alpha_t": [float(value) for value in (0.2 * torch.sigmoid(self.raw_alpha_t)).detach().cpu().tolist()],
+            "final_gain_re": float(self.final_gain_re.item()),
+            "final_gain_im": float(self.final_gain_im.item()),
+        }
+
+    def _gain(self) -> torch.Tensor:
+        return _complex_gain(self.final_gain_re, self.final_gain_im)
+
+    def _build_features(
+        self,
+        s_hat: torch.Tensor,
+        z0: torch.Tensor,
+        r_t: torch.Tensor,
+        d_hat: torch.Tensor,
+    ) -> torch.Tensor:
+        feature_list = [
+            torch.real(s_hat),
+            torch.imag(s_hat),
+            torch.real(z0),
+            torch.imag(z0),
+            torch.real(r_t),
+            torch.imag(r_t),
+            torch.real(s_hat - r_t),
+            torch.imag(s_hat - r_t),
+            torch.abs(d_hat),
+            torch.angle(d_hat),
+        ]
+        return torch.stack(feature_list, dim=1).to(torch.float32)
+
+    def forward_refine(
+        self,
+        z0: torch.Tensor,
+        delta_condition: torch.Tensor,
+        *,
+        disable_neural: bool = False,
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, object]] | torch.Tensor:
+        A_hat = build_a_hat(self.W_tx, self.V, delta_condition, phi_sign=self.phi_sign)
+        d_hat = torch.diagonal(A_hat, dim1=-2, dim2=-1)
+        rho_t = 0.1 + 0.9 * torch.sigmoid(self.raw_rho_t)
+        gamma_t = F.softplus(self.raw_gamma_t)
+        alpha_t = 0.2 * torch.sigmoid(self.raw_alpha_t)
+        if disable_neural:
+            alpha_t = torch.zeros_like(alpha_t)
+
+        s_hat = z0
+        iterates: list[torch.Tensor] = []
+        anchors: list[torch.Tensor] = []
+        residuals: list[torch.Tensor] = []
+        for layer_idx in range(self.num_layers):
+            denom = 1.0 + gamma_t[layer_idx] * (d_hat - 1.0)
+            r_t = _safe_divide(z0, denom)
+            anchors.append(r_t)
+            features = self._build_features(s_hat, z0, r_t, d_hat)
+            delta_tensor = self.blocks[layer_idx](features)
+            delta_complex = torch.complex(delta_tensor[:, 0, :], delta_tensor[:, 1, :]).to(torch.complex64)
+            residuals.append(delta_complex)
+            s_hat = (1.0 - rho_t[layer_idx]) * s_hat + rho_t[layer_idx] * (r_t + alpha_t[layer_idx] * delta_complex)
+            iterates.append(s_hat)
+
+        corrected = self._gain() * s_hat
+        iterates[-1] = corrected
+        aux = {
+            "A_hat": A_hat,
+            "diag": d_hat,
+            "iterates": iterates,
+            "anchors": anchors,
+            "residuals": residuals,
+            "eps_hat": delta_condition,
+            "r_core": anchors[0],
+            "rho_t": [float(value) for value in rho_t.detach().cpu().tolist()],
+            "gamma_t": [float(value) for value in gamma_t.detach().cpu().tolist()],
+            "alpha_t": [float(value) for value in alpha_t.detach().cpu().tolist()],
+        }
+        return (corrected, aux) if return_aux else corrected
+
+    def forward(
+        self,
+        z0: torch.Tensor,
+        *,
+        ebn0_db_values: float | torch.Tensor | None = None,
+        eps_override: torch.Tensor | None = None,
+        eps_true: torch.Tensor | None = None,
+        eval_seed: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+        if eps_true is None and eps_override is None:
+            raise ValueError("USR-Net requires the true residual CFO to synthesize the receiver-state condition.")
+        base_condition = eps_true if eps_true is not None else eps_override
+        assert base_condition is not None
+        delta_condition = base_condition.to(torch.float32) + _sample_condition_noise_like(
+            base_condition.to(torch.float32),
+            self.eval_condition_sigma,
+            eval_seed=eval_seed,
+            seed_offset=101,
+        )
+        corrected, aux = self.forward_refine(z0, delta_condition, return_aux=True)
+        logits = _constellation_logits(corrected)
+        aux["stage2_eps_hat_mae"] = float(torch.mean(torch.abs(delta_condition - base_condition.to(torch.float32))).item())
+        return corrected, logits, aux
+
+
+@dataclass
+class USRNetTrainingBundle:
+    receiver: UnfoldedSymbolRefiner
+    core_reference: DiagonalCoreReference
+    history_df: pd.DataFrame
+    stage_summary_df: pd.DataFrame
+
+
+@dataclass
+class CoreReferenceTrainingBundle:
+    receiver: DiagonalCoreReference
+    history_df: pd.DataFrame
+    stage_summary_df: pd.DataFrame
+
+
+def _sample_training_batch(
+    config: ExperimentConfig,
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    *,
+    batch_size: int,
+    delta_span: float,
+    ebn0_choices: tuple[float, ...],
+    sigma_condition: float | tuple[float, ...],
+) -> dict[str, torch.Tensor]:
+    true_bits, true_symbols = random_symbols(
+        batch_size=batch_size,
+        N=config.N,
+        modulation=config.modulation,
+        bits_per_symbol=config.bits_per_symbol,
+        device=config.device,
+    )
+    delta_true = (2.0 * torch.rand(batch_size, device=config.device) - 1.0) * float(delta_span)
+    ebn0_idx = torch.randint(0, len(ebn0_choices), (batch_size,), device=config.device)
+    ebn0_values = torch.tensor(ebn0_choices, device=config.device, dtype=torch.float32)[ebn0_idx]
+    x = transmit_symbols(true_symbols, W_tx)
+    y, _ = propagate(x, delta_true, config, ebn0_db=ebn0_values)
+    z0 = decode_symbols(y, V)
+    if isinstance(sigma_condition, tuple):
+        sigma_idx = torch.randint(0, len(sigma_condition), (batch_size,), device=config.device)
+        sigma_values = torch.tensor(sigma_condition, device=config.device, dtype=torch.float32)[sigma_idx]
+    else:
+        sigma_values = torch.full((batch_size,), float(sigma_condition), device=config.device, dtype=torch.float32)
+    delta_condition = delta_true + sigma_values * torch.randn_like(delta_true)
+    return {
+        "true_bits": true_bits,
+        "true_symbols": true_symbols,
+        "delta_true": delta_true.to(torch.float32),
+        "delta_condition": delta_condition.to(torch.float32),
+        "z0": z0,
+        "ebn0_values": ebn0_values,
+    }
+
+
+def _evaluate_validation_grid(
+    config: ExperimentConfig,
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    receiver: UnfoldedSymbolRefiner | DiagonalCoreReference,
+    *,
+    sigma_condition: float,
+    seed: int,
+) -> dict[str, float]:
+    set_seed(seed)
+    ber_rows: list[float] = []
+    total_loss = 0.0
+    total_guard = 0.0
+    for delta_value in (0.0, 0.05, 0.10, -0.05, -0.10):
+        batch = _sample_training_batch(
+            config,
+            W_tx,
+            V,
+            batch_size=min(config.ber_batch_size, 256),
+            delta_span=abs(delta_value) if abs(delta_value) > 0.0 else 0.001,
+            ebn0_choices=DEFAULT_EBN0_CHOICES,
+            sigma_condition=sigma_condition,
+        )
+        if abs(delta_value) > 0.0:
+            batch["delta_true"] = torch.full_like(batch["delta_true"], float(delta_value))
+            x = transmit_symbols(batch["true_symbols"], W_tx)
+            y, _ = propagate(x, batch["delta_true"], config, ebn0_db=batch["ebn0_values"])
+            batch["z0"] = decode_symbols(y, V)
+            batch["delta_condition"] = batch["delta_true"] + float(sigma_condition) * torch.randn_like(batch["delta_true"])
+
+        with torch.no_grad():
+            if isinstance(receiver, UnfoldedSymbolRefiner):
+                corrected, aux = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
+                r_core = aux["r_core"]
+                net_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
+                core_mse = _normalized_batch_mse(r_core, batch["true_symbols"])
+                guard_loss = torch.relu(net_mse - core_mse) ** 2
+                total_guard += float(guard_loss.item())
+            else:
+                corrected, _ = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
+            bits_hat, _ = slice_symbols(corrected, config.modulation)
+            ber_rows.append(float(torch.mean((bits_hat != batch["true_bits"]).to(torch.float32)).item()))
+            total_loss += float(_normalized_batch_mse(corrected, batch["true_symbols"]).item())
+
+    hard_cfo_weighted_ber = float(np.mean([ber_rows[1], ber_rows[2], ber_rows[3], ber_rows[4]]))
+    val_ber = float(np.mean(ber_rows))
+    return {
+        "val_total": total_loss / len(ber_rows),
+        "val_ber": val_ber,
+        "hard_cfo_weighted_ber": hard_cfo_weighted_ber,
+        "guard_loss": total_guard / max(1, len(ber_rows)),
+    }
+
+
+def _core_reference_loss(
+    receiver: DiagonalCoreReference,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    corrected, aux = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
+    labels = qam16_labels_from_bits(batch["true_bits"]).reshape(-1)
+    L_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
+    logits = _constellation_logits(corrected)
+    L_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels)
+    identity_mask = torch.abs(batch["delta_true"]) < 0.02
+    if torch.any(identity_mask):
+        L_id = _normalized_reference_mse(corrected[identity_mask], batch["z0"][identity_mask], batch["z0"][identity_mask])
+    else:
+        L_id = torch.zeros((), device=corrected.device, dtype=torch.float32)
+    L_corr = _correction_norm(corrected, batch["z0"])
+    loss = L_mse + 0.3 * L_cls + 0.1 * L_id + 1.0e-4 * L_corr
+    metrics = {
+        "train_total": float(loss.item()),
+        "train_Lmse": float(L_mse.item()),
+        "train_Lce": float(L_cls.item()),
+        "train_Lid": float(L_id.item()),
+        "train_Lcorr": float(L_corr.item()),
+        "residual_scale": float(receiver.parameter_summary()["rho"]),
+        "guard_loss": 0.0,
+    }
+    return loss, metrics
+
+
+def _usrnet_loss(
+    receiver: UnfoldedSymbolRefiner,
+    core_reference: DiagonalCoreReference,
+    batch: dict[str, torch.Tensor],
+    *,
+    disable_neural: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    corrected, aux = receiver.forward_refine(
+        batch["z0"],
+        batch["delta_condition"],
+        disable_neural=disable_neural,
+        return_aux=True,
+    )
+    with torch.no_grad():
+        r_core, _ = core_reference.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
+    iterates = list(aux["iterates"])
+    weights = list(DEFAULT_LAYER_WEIGHTS[: len(iterates)])
+    L_sym = sum(weight * _normalized_batch_mse(est, batch["true_symbols"]) for weight, est in zip(weights, iterates))
+    labels = qam16_labels_from_bits(batch["true_bits"]).reshape(-1)
+    logits = _constellation_logits(corrected)
+    L_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels)
+    identity_mask = torch.abs(batch["delta_true"]) < 0.02
+    if torch.any(identity_mask):
+        L_id = _normalized_reference_mse(corrected[identity_mask], batch["z0"][identity_mask], batch["z0"][identity_mask])
+    else:
+        L_id = torch.zeros((), device=corrected.device, dtype=torch.float32)
+    L_corr = _correction_norm(corrected, batch["z0"])
+    core_mse = _normalized_batch_mse(r_core, batch["true_symbols"])
+    net_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
+    L_guard = torch.relu(net_mse - core_mse) ** 2
+    loss = L_sym + 0.3 * L_cls + 0.1 * L_id + 1.0e-4 * L_corr + 0.5 * L_guard
+    alpha_values = receiver.parameter_summary()["alpha_t"]
+    metrics = {
+        "train_total": float(loss.item()),
+        "train_Lmse": float(L_sym.item()),
+        "train_Lce": float(L_cls.item()),
+        "train_Lid": float(L_id.item()),
+        "train_Lcorr": float(L_corr.item()),
+        "guard_loss": float(L_guard.item()),
+        "core_mse": float(core_mse.item()),
+        "net_mse": float(net_mse.item()),
+        "residual_scale": float(np.mean(alpha_values)),
+    }
+    return loss, metrics
+
+
+def train_diagonal_core_reference(
+    config: ExperimentConfig,
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    *,
+    scheme_name: str,
+    phi_sign: int,
+    smoke_mode: bool = False,
+    seed_offset: int = 0,
+) -> CoreReferenceTrainingBundle:
+    set_seed(config.base_seed + 11_000 + int(seed_offset))
+    receiver = DiagonalCoreReference(W_tx, V, phi_sign=phi_sign, eval_condition_sigma=DEFAULT_SIGMA_CONDITION).to(config.device)
+    epochs = 5 if smoke_mode else 50
+    batch_size = 256 if smoke_mode else 512
+    optimizer = torch.optim.Adam(receiver.parameters(), lr=1.0e-3)
+    history_rows: list[dict[str, object]] = []
+    best_row: dict[str, object] | None = None
+    best_val_total = float("inf")
+    started = perf_counter()
+    for epoch_idx in range(epochs):
+        receiver.train()
+        batch = _sample_training_batch(
+            config,
+            W_tx,
+            V,
+            batch_size=batch_size,
+            delta_span=0.15,
+            ebn0_choices=DEFAULT_EBN0_CHOICES,
+            sigma_condition=DEFAULT_SIGMA_CONDITION,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss, metrics = _core_reference_loss(receiver, batch)
+        loss.backward()
+        optimizer.step()
+        val_metrics = _evaluate_validation_grid(config, W_tx, V, receiver, sigma_condition=DEFAULT_SIGMA_CONDITION, seed=config.base_seed + 20_000 + epoch_idx)
+        row = {
+            "scheme": scheme_name,
+            "global_epoch": epoch_idx + 1,
+            "train_total": metrics["train_total"],
+            "train_Lmse": metrics["train_Lmse"],
+            "train_Lce": metrics["train_Lce"],
+            "train_Lid": metrics["train_Lid"],
+            "train_Lcorr": metrics["train_Lcorr"],
+            "guard_loss": metrics["guard_loss"],
+            "val_total": val_metrics["val_total"],
+            "val_ber": val_metrics["val_ber"],
+            "residual_scale": metrics["residual_scale"],
+            "phase": "CoreReference",
+        }
+        history_rows.append(row)
+        if val_metrics["val_total"] < best_val_total:
+            best_val_total = val_metrics["val_total"]
+            best_row = {
+                "scheme": scheme_name,
+                "stage": "CoreReference",
+                "best_global_epoch": epoch_idx + 1,
+                "val_total": val_metrics["val_total"],
+                "val_ber": val_metrics["val_ber"],
+                "hard_cfo_weighted_ber": val_metrics["hard_cfo_weighted_ber"],
+                "guard_loss": val_metrics["guard_loss"],
+                "elapsed_seconds": float(perf_counter() - started),
+                **receiver.parameter_summary(),
+            }
+        if epoch_idx in {0, epochs - 1} or (epochs >= 20 and (epoch_idx + 1) % 10 == 0):
+            log_terminal_progress(
+                config,
+                f"[USRNet] {scheme_name} core epoch={epoch_idx + 1:03d}/{epochs:03d} "
+                f"train={metrics['train_total']:.4e} val={val_metrics['val_total']:.4e} ber={val_metrics['val_ber']:.4e}",
+            )
+    if best_row is None:
+        raise RuntimeError("Core reference training did not record a best validation row.")
+    return CoreReferenceTrainingBundle(
+        receiver=receiver.eval(),
+        history_df=pd.DataFrame(history_rows),
+        stage_summary_df=pd.DataFrame([best_row]),
+    )
+
+
+def train_usrnet_receiver(
+    config: ExperimentConfig,
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    core_reference: DiagonalCoreReference,
+    *,
+    scheme_name: str,
+    phi_sign: int,
+    smoke_mode: bool = False,
+    seed_offset: int = 0,
+) -> USRNetTrainingBundle:
+    set_seed(config.base_seed + 31_000 + int(seed_offset))
+    receiver = UnfoldedSymbolRefiner(W_tx, V, phi_sign=phi_sign, eval_condition_sigma=DEFAULT_SIGMA_CONDITION).to(config.device)
+    core_params = core_reference.parameter_summary()
+    with torch.no_grad():
+        receiver.raw_gamma_t.fill_(_inverse_softplus(float(core_params["gamma"])))
+        receiver.raw_rho_t.fill_(_raw_rho_from_target(float(core_params["rho"])))
+        receiver.final_gain_re.fill_(float(core_params["final_gain_re"]))
+        receiver.final_gain_im.fill_(float(core_params["final_gain_im"]))
+
+    phase_specs = [
+        {
+            "name": "Phase0CoreMatch",
+            "epochs": 5 if smoke_mode else 50,
+            "learning_rate": 1.0e-3,
+            "sigma_condition": DEFAULT_SIGMA_CONDITION,
+            "disable_neural": True,
+            "train_conv": False,
+            "train_alpha": False,
+        },
+        {
+            "name": "Phase1NeuralUnfreeze",
+            "epochs": 5 if smoke_mode else 150,
+            "learning_rate": 5.0e-4,
+            "sigma_condition": DEFAULT_SIGMA_CONDITION,
+            "disable_neural": False,
+            "train_conv": True,
+            "train_alpha": True,
+        },
+        {
+            "name": "Phase2Robustness",
+            "epochs": 5 if smoke_mode else 100,
+            "learning_rate": 2.0e-4,
+            "sigma_condition": (0.0, 0.0025, 0.0050, 0.0100, 0.0200),
+            "disable_neural": False,
+            "train_conv": True,
+            "train_alpha": True,
+        },
+    ]
+
+    history_rows: list[dict[str, object]] = []
+    stage_rows: list[dict[str, object]] = []
+    global_epoch = 0
+    batch_size = 256 if smoke_mode else 512
+
+    for phase_idx, phase in enumerate(phase_specs):
+        for parameter in receiver.blocks.parameters():
+            parameter.requires_grad = bool(phase["train_conv"])
+        receiver.raw_alpha_t.requires_grad = bool(phase["train_alpha"])
+        receiver.raw_gamma_t.requires_grad = True
+        receiver.raw_rho_t.requires_grad = True
+        receiver.final_gain_re.requires_grad = True
+        receiver.final_gain_im.requires_grad = True
+
+        optimizer = torch.optim.Adam(
+            [parameter for parameter in receiver.parameters() if parameter.requires_grad],
+            lr=float(phase["learning_rate"]),
+        )
+        best_val_total = float("inf")
+        best_row: dict[str, object] | None = None
+        phase_start = perf_counter()
+        epochs = int(phase["epochs"])
+        for epoch_idx in range(epochs):
+            receiver.train()
+            batch = _sample_training_batch(
+                config,
+                W_tx,
+                V,
+                batch_size=batch_size,
+                delta_span=0.15,
+                ebn0_choices=DEFAULT_EBN0_CHOICES,
+                sigma_condition=phase["sigma_condition"],
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss, metrics = _usrnet_loss(
+                receiver,
+                core_reference,
+                batch,
+                disable_neural=bool(phase["disable_neural"]),
+            )
+            loss.backward()
+            optimizer.step()
+            global_epoch += 1
+            val_metrics = _evaluate_validation_grid(
+                config,
+                W_tx,
+                V,
+                receiver,
+                sigma_condition=DEFAULT_SIGMA_CONDITION,
+                seed=config.base_seed + 40_000 + 1_000 * phase_idx + epoch_idx,
+            )
+            params = receiver.parameter_summary()
+            history_rows.append(
+                {
+                    "scheme": scheme_name,
+                    "global_epoch": global_epoch,
+                    "train_total": metrics["train_total"],
+                    "train_Lmse": metrics["train_Lmse"],
+                    "train_Lce": metrics["train_Lce"],
+                    "train_Lid": metrics["train_Lid"],
+                    "train_Lcorr": metrics["train_Lcorr"],
+                    "guard_loss": metrics["guard_loss"],
+                    "val_total": val_metrics["val_total"],
+                    "val_ber": val_metrics["val_ber"],
+                    "residual_scale": metrics["residual_scale"],
+                    "phase": phase["name"],
+                    "rho_t": repr(params["rho_t"]),
+                    "gamma_t": repr(params["gamma_t"]),
+                    "alpha_t": repr(params["alpha_t"]),
+                }
+            )
+            if val_metrics["val_total"] < best_val_total:
+                best_val_total = val_metrics["val_total"]
+                best_row = {
+                    "scheme": scheme_name,
+                    "stage": phase["name"],
+                    "best_global_epoch": global_epoch,
+                    "best_stage_epoch": epoch_idx + 1,
+                    "val_total": val_metrics["val_total"],
+                    "val_ber": val_metrics["val_ber"],
+                    "hard_cfo_weighted_ber": val_metrics["hard_cfo_weighted_ber"],
+                    "guard_loss": val_metrics["guard_loss"],
+                    "elapsed_seconds": float(perf_counter() - phase_start),
+                    "rho_t": repr(params["rho_t"]),
+                    "gamma_t": repr(params["gamma_t"]),
+                    "alpha_t": repr(params["alpha_t"]),
+                    "final_gain_re": params["final_gain_re"],
+                    "final_gain_im": params["final_gain_im"],
+                }
+            if epoch_idx in {0, epochs - 1} or (epochs >= 20 and (epoch_idx + 1) % 25 == 0):
+                log_terminal_progress(
+                    config,
+                    f"[USRNet] {scheme_name} {phase['name']} epoch={epoch_idx + 1:03d}/{epochs:03d} "
+                    f"train={metrics['train_total']:.4e} val={val_metrics['val_total']:.4e} "
+                    f"ber={val_metrics['val_ber']:.4e} guard={metrics['guard_loss']:.4e}",
+                )
+        if best_row is None:
+            raise RuntimeError(f"USR-Net phase {phase['name']} did not record a best validation row.")
+        stage_rows.append(best_row)
+
+    return USRNetTrainingBundle(
+        receiver=receiver.eval(),
+        core_reference=core_reference.eval(),
+        history_df=pd.DataFrame(history_rows),
+        stage_summary_df=pd.DataFrame(stage_rows),
+    )
+
+
+def select_phi_sign(
+    config: ExperimentConfig,
+    schemes: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    *,
+    seed: int,
+) -> tuple[int, pd.DataFrame]:
+    set_seed(seed)
+    rows: list[dict[str, object]] = []
+    delta_true = 0.10
+    batch_size = min(int(config.ber_batch_size), 256)
+    true_bits, true_symbols = random_symbols(
+        batch_size=batch_size,
+        N=config.N,
+        modulation=config.modulation,
+        bits_per_symbol=config.bits_per_symbol,
+        device=config.device,
+    )
+    del true_bits
+    delta_tensor = torch.full((batch_size,), float(delta_true), device=config.device, dtype=torch.float32)
+    for scheme_name, (W_tx, V) in schemes.items():
+        x = transmit_symbols(true_symbols, W_tx)
+        y, _ = propagate(x, delta_tensor, config, ebn0_db=20.0)
+        z0 = decode_symbols(y, V)
+        for phi_sign in (+1, -1):
+            A_hat = build_a_hat(W_tx, V, delta_tensor, phi_sign=phi_sign)
+            d_hat = torch.diagonal(A_hat, dim1=-2, dim2=-1)
+            corrected = _safe_divide(z0, d_hat)
+            rows.append(
+                {
+                    "scheme": scheme_name,
+                    "phi_sign": phi_sign,
+                    "delta": delta_true,
+                    "oracle_rule": "diag_only_sign_probe",
+                    "EVM": float(normalized_symbol_mse(corrected, true_symbols).item()),
+                }
+            )
+    sign_df = pd.DataFrame(rows)
+    plus_score = float(sign_df[sign_df["phi_sign"] == 1]["EVM"].mean())
+    minus_score = float(sign_df[sign_df["phi_sign"] == -1]["EVM"].mean())
+    return (1 if plus_score <= minus_score else -1), sign_df.sort_values(["scheme", "phi_sign"]).reset_index(drop=True)
+
+
+def evaluate_usrnet_scheme(
+    config: ExperimentConfig,
+    W_tx: torch.Tensor,
+    V: torch.Tensor,
+    receiver: UnfoldedSymbolRefiner | DiagonalCoreReference | None,
+    *,
+    method_name: str,
+    delta_value: float,
+    ebn0_db: float,
+    sigma_condition: float,
+    num_blocks: int,
+    batch_size: int,
+    seed: int,
+    capture_points: int = 0,
+    phi_sign: int = DEFAULT_PHI_SIGN,
+) -> dict[str, object]:
+    set_seed(seed)
+    total_bits = 0
+    bit_errors = 0
+    total_symbols = 0
+    evm_sum = 0.0
+    correction_sum = 0.0
+    condition_mae_sum = 0.0
+    per_layer_evm_sum: np.ndarray | None = None
+    per_layer_ber_sum: np.ndarray | None = None
+    diag_stats_accum = {"mean_abs_diag": 0.0, "std_abs_diag": 0.0, "mean_angle_diag": 0.0, "offdiag_energy_ratio": 0.0}
+    total_batches = 0
+    constellation_points: list[tuple[float, float]] = []
+
+    remaining = int(num_blocks)
+    batch_index = 0
+    while remaining > 0:
+        current_batch = min(int(batch_size), remaining)
+        remaining -= current_batch
+        batch_index += 1
+        true_bits, true_symbols = random_symbols(
+            batch_size=current_batch,
+            N=config.N,
+            modulation=config.modulation,
+            bits_per_symbol=config.bits_per_symbol,
+            device=config.device,
+        )
+        delta_true = torch.full((current_batch,), float(delta_value), device=config.device, dtype=torch.float32)
+        x = transmit_symbols(true_symbols, W_tx)
+        y, _ = propagate(x, delta_true, config, ebn0_db=ebn0_db)
+        z0 = decode_symbols(y, V)
+        delta_condition = delta_true + float(sigma_condition) * torch.randn_like(delta_true)
+        A_hat = build_a_hat(W_tx, V, delta_condition, phi_sign=phi_sign)
+        diag_stats = operator_diagnostics_from_a_hat(A_hat)
+
+        if receiver is None:
+            corrected = z0
+            iterates: list[torch.Tensor] = []
+            used_condition = delta_condition
+        else:
+            with torch.no_grad():
+                corrected, aux = receiver.forward_refine(z0, delta_condition, return_aux=True)
+            iterates = list(aux["iterates"])
+            used_condition = aux["eps_hat"].to(torch.float32)
+
+        bits_hat, _ = slice_symbols(corrected, config.modulation)
+        total_bits += true_bits.numel()
+        bit_errors += int(torch.sum(bits_hat != true_bits).item())
+        total_symbols += current_batch * config.N
+        evm_sum += float(normalized_symbol_mse(corrected, true_symbols).item()) * current_batch
+        correction_sum += float(_correction_norm(corrected, z0).item()) * current_batch
+        condition_mae_sum += float(torch.mean(torch.abs(used_condition - delta_true)).item()) * current_batch
+        for key in diag_stats_accum:
+            diag_stats_accum[key] += float(diag_stats[key]) * current_batch
+
+        if iterates:
+            layer_evms = np.asarray([float(normalized_symbol_mse(state, true_symbols).item()) for state in iterates], dtype=np.float64)
+            layer_bers = np.asarray(
+                [float(torch.mean((slice_symbols(state, config.modulation)[0] != true_bits).to(torch.float32)).item()) for state in iterates],
+                dtype=np.float64,
+            )
+            if per_layer_evm_sum is None:
+                per_layer_evm_sum = np.zeros_like(layer_evms)
+                per_layer_ber_sum = np.zeros_like(layer_bers)
+            per_layer_evm_sum += layer_evms * current_batch
+            assert per_layer_ber_sum is not None
+            per_layer_ber_sum += layer_bers * current_batch
+
+        if capture_points > 0 and len(constellation_points) < capture_points:
+            flattened = corrected.reshape(-1)
+            take_count = min(capture_points - len(constellation_points), flattened.numel())
+            for point in flattened[:take_count]:
+                constellation_points.append((float(torch.real(point).item()), float(torch.imag(point).item())))
+        total_batches += current_batch
+
+    result = {
+        "method": method_name,
+        "BER": float(bit_errors / max(1, total_bits)),
+        "EVM": float(evm_sum / max(1, total_batches)),
+        "correction_norm": float(correction_sum / max(1, total_batches)),
+        "condition_mae": float(condition_mae_sum / max(1, total_batches)),
+        "constellation_points": constellation_points,
+    }
+    for key, value in diag_stats_accum.items():
+        result[key] = float(value / max(1, total_batches))
+    if per_layer_evm_sum is not None and per_layer_ber_sum is not None:
+        result["per_layer_evm"] = (per_layer_evm_sum / max(1, total_batches)).tolist()
+        result["per_layer_ber"] = (per_layer_ber_sum / max(1, total_batches)).tolist()
+    return result
+
+
+def build_usrnet_schemes(
+    ofdm_tx: torch.Tensor,
+    ofdm_rx: torch.Tensor,
+    learned_tx: torch.Tensor,
+    learned_rx: torch.Tensor,
+    ofdm_receiver: UnfoldedSymbolRefiner,
+    learned_receiver: UnfoldedSymbolRefiner,
+) -> dict[str, EvaluationScheme]:
+    return {
+        "OFDM": EvaluationScheme(tx_basis=ofdm_tx, rx_basis=ofdm_rx, nonlinear_receiver=None),
+        "OFDMUSRNet": EvaluationScheme(
+            tx_basis=ofdm_tx,
+            rx_basis=ofdm_rx,
+            nonlinear_receiver=ofdm_receiver.eval(),
+            oracle_eps_conditioning=True,
+        ),
+        "Learned": EvaluationScheme(tx_basis=learned_tx, rx_basis=learned_rx, nonlinear_receiver=None),
+        "LearnedUSRNet": EvaluationScheme(
+            tx_basis=learned_tx,
+            rx_basis=learned_rx,
+            nonlinear_receiver=learned_receiver.eval(),
+            oracle_eps_conditioning=True,
+        ),
+    }
