@@ -33,6 +33,8 @@ from transmitter import frame_resource_layout, make_ofdm_baseline_transceiver, s
 METHOD_ORDER = (
     "OFDM",
     "OFDMNonlinear",
+    "OFDMGRRNet",
+    "OFDMUSRNet",
     "Learned",
     "LearnedOraclePreV",
     "LearnedOracleMMSE",
@@ -47,17 +49,21 @@ METHOD_ORDER = (
     "LearnedOracleMMSENoise0p20",
     "LearnedOracleMMSENoise0p40",
     "LearnedNonlinear",
+    "LearnedGRRNet",
+    "LearnedUSRNet",
     "LearnedNonlinearOracleEps",
     "LearnedSpectral",
 )
 METHOD_DISPLAY_NAMES = {
     "OFDM": "Classical OFDM",
     "OFDMNonlinear": "OFDM + Stage 2",
+    "OFDMGRRNet": "OFDM + GRR-Net",
     "OFDMUSRNet": "OFDM + USR-Net",
     "Learned": "Learned Basis",
     "LearnedOraclePreV": "Learned + Oracle Pre-V CFO",
     "LearnedOracleMMSE": "Learned + Oracle MMSE",
     "LearnedNonlinear": "Learned + Stage 2",
+    "LearnedGRRNet": "Learned + GRR-Net",
     "LearnedUSRNet": "Learned + USR-Net",
     "LearnedNonlinearOracleEps": "Learned + Stage 2 (True delta)",
     "LearnedSpectral": "Learned + Spectral Mask",
@@ -65,11 +71,13 @@ METHOD_DISPLAY_NAMES = {
 METHOD_COLORS = {
     "OFDM": "#3A5F8A",
     "OFDMNonlinear": "#79A7D3",
+    "OFDMGRRNet": "#4F81BD",
     "OFDMUSRNet": "#79A7D3",
     "Learned": "#C05A2B",
     "LearnedOraclePreV": "#7E6AA2",
     "LearnedOracleMMSE": "#2D8A5F",
     "LearnedNonlinear": "#E39A5F",
+    "LearnedGRRNet": "#D07A3A",
     "LearnedUSRNet": "#E39A5F",
     "LearnedNonlinearOracleEps": "#C74B50",
     "LearnedSpectral": "#2D8A5F",
@@ -222,6 +230,11 @@ def transmitter_plot_method_order(
 
 
 def _usrnet_stage1_methods(methods: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    available = list(methods)
+    return [method for method in ("OFDM", "Learned") if method in available]
+
+
+def _frozen_stage2_stage1_methods(methods: list[str] | tuple[str, ...] | set[str]) -> list[str]:
     available = list(methods)
     return [method for method in ("OFDM", "Learned") if method in available]
 
@@ -1579,6 +1592,38 @@ def plot_training_loss_components(config: ExperimentConfig, history_df: pd.DataF
         plt.close(fig)
         return path
 
+    if config.stage2_enabled and "train_Lsym" in history_df.columns and "train_Lcls" in history_df.columns:
+        fig, axes = plt.subplots(2, 1, figsize=(11, 7), dpi=130, constrained_layout=True, sharex=True)
+
+        for stage, group in history_df.groupby("stage"):
+            axes[0].plot(group["global_epoch"], group["train_total"], linewidth=2, label=stage)
+        axes[0].set_title(
+            f"{config.modulation} GRR-Net loss curves | N={config.N}, M={config.M} | train {config.train_ebn0_db:.0f} dB"
+        )
+        axes[0].set_ylabel("Total loss")
+        axes[0].legend()
+
+        component_specs = [
+            ("train_Lsym", r"$L_{\mathrm{sym}}$"),
+            ("train_Lcls", r"$L_{\mathrm{cls}}$"),
+            ("train_Lid", r"$L_{\mathrm{id}}$"),
+            ("train_Lcorr", r"$L_{\mathrm{corr}}$"),
+            ("alpha", r"$\alpha$"),
+            ("correction_norm", "correction norm"),
+        ]
+        for key, label in component_specs:
+            if key not in history_df.columns:
+                continue
+            axes[1].plot(history_df["global_epoch"], history_df[key], linewidth=2, label=label)
+        axes[1].set_title("GRR-Net loss components")
+        axes[1].set_xlabel("Global epoch")
+        axes[1].set_ylabel("Value")
+        axes[1].legend(ncol=2)
+
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
     fig, axes = plt.subplots(2, 1, figsize=(11, 7), dpi=130, constrained_layout=True, sharex=True)
 
     for stage, group in history_df.groupby("stage"):
@@ -1892,6 +1937,8 @@ def plot_constellation_snapshots(
     cfo_values = [float(eps) for eps in sorted(constellation_df["eps"].unique())]
     if config.stage2_enabled and config.stage2_workflow == "USR_NET":
         preferred_order = ("OFDM", "Learned", "OFDMUSRNet", "LearnedUSRNet")
+    if config.stage2_enabled and config.stage2_workflow == "GRR_NET" and preferred_order is None:
+        preferred_order = ("OFDM", "Learned", "OFDMGRRNet", "LearnedGRRNet")
     method_names = ordered_methods(constellation_df["method"].unique().tolist(), preferred_order)
     fig, axes = plt.subplots(
         len(method_names),
@@ -1985,8 +2032,8 @@ def plot_time_domain_waveform(
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
     method_names = transmitter_plot_method_order(schemes, preferred_order)
-    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
-        method_names = _usrnet_stage1_methods(method_names)
+    if config.stage2_enabled and config.stage2_workflow in {"USR_NET", "GRR_NET"}:
+        method_names = _frozen_stage2_stage1_methods(method_names)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -2015,8 +2062,8 @@ def plot_time_domain_envelope_phase(
     _, symbols = sample_training_symbols(1, config)
     time = np.arange(config.M)
     method_names = transmitter_plot_method_order(schemes, preferred_order)
-    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
-        method_names = _usrnet_stage1_methods(method_names)
+    if config.stage2_enabled and config.stage2_workflow in {"USR_NET", "GRR_NET"}:
+        method_names = _frozen_stage2_stage1_methods(method_names)
 
     fig, axes = plt.subplots(len(method_names), 1, figsize=(9.0, 3.2 * len(method_names)), dpi=130, constrained_layout=True)
     axes = np.asarray(axes, dtype=object).reshape(len(method_names), 1)
@@ -2044,8 +2091,8 @@ def plot_papr_ccdf(
 ) -> Path | None:
     if papr_df.empty:
         return None
-    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
-        papr_df = papr_df[papr_df["method"].isin(_usrnet_stage1_methods(papr_df["method"].unique().tolist()))]
+    if config.stage2_enabled and config.stage2_workflow in {"USR_NET", "GRR_NET"}:
+        papr_df = papr_df[papr_df["method"].isin(_frozen_stage2_stage1_methods(papr_df["method"].unique().tolist()))]
         if papr_df.empty:
             return None
     fig = plt.figure(figsize=(7.6, 4.4), dpi=130)
@@ -2081,8 +2128,8 @@ def plot_spectral_fairness(
 ) -> Path | None:
     if spectral_df.empty:
         return None
-    if config.stage2_enabled and config.stage2_workflow == "USR_NET":
-        keep_methods = _usrnet_stage1_methods(spectral_df["method"].unique().tolist())
+    if config.stage2_enabled and config.stage2_workflow in {"USR_NET", "GRR_NET"}:
+        keep_methods = _frozen_stage2_stage1_methods(spectral_df["method"].unique().tolist())
         spectral_df = spectral_df[spectral_df["method"].isin(keep_methods)]
         papr_df = papr_df[papr_df["method"].isin(keep_methods)]
         if spectral_df.empty:
@@ -2151,6 +2198,26 @@ def build_mapping_markdown(config: ExperimentConfig) -> str:
                     "- The block condition `c_b` is a receiver-state condition used only to build the diagonal anchor from the fixed operator `A_hat(c_b) = V Phi(c_b) W`.",
                     "- The main path uses only the diagonal of `A_hat(c_b)`; it does not apply off-diagonal MMSE-style cancellation in the practical receiver.",
                     "- The learned residual branch is explicitly bounded through small `alpha_t` coefficients so the network can stay close to the stable diagonal anchor when that is optimal.",
+                ]
+            )
+        if getattr(config, "stage2_workflow", "").upper() == "GRR_NET":
+            conditioned = bool(getattr(config, "grrnet_conditioned", True))
+            rank = int(getattr(config, "grrnet_rank", 16))
+            if conditioned:
+                state_line = "- The receiver-state condition `c_b` is appended only as a raw scalar feature per symbol; it is not used to build `A_hat`, diagonal anchors, or any analytical correction."
+            else:
+                state_line = "- The blind variant uses only observable post-`V` soft-symbol features from `z_0`."
+            return "\n".join(
+                [
+                    "**GRR-Net Post-V Global Residual Refinement**",
+                    "",
+                    r"$z_0 = V y,\quad \hat{s} = g_\theta(z_0, c_b),\quad \hat{s} = z_0 + \alpha\,\Delta_\theta(z_0, c_b)$",
+                    "",
+                    "- The Stage 1 linear front end remains frozen and interpretable.",
+                    "- GRR-Net is a black-box post-V global residual refiner with explicit all-to-all symbol mixing through a low-rank global mixer.",
+                    f"- The configured global mixer rank is `{rank}` and the bounded correction scale is learned through `alpha = 0.2 * sigmoid(raw_alpha)`.",
+                    state_line,
+                    "- GRR-Net does not build `A_hat`, does not use a diagonal anchor, and does not apply MMSE-style operator inversion in the practical receiver.",
                 ]
             )
         if getattr(config, "stage2_sideinfo_enabled", False):
@@ -2235,6 +2302,65 @@ def build_summary_markdown(
     preferred_order: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     if config.stage2_enabled:
+        if config.stage2_workflow == "GRR_NET":
+            available_methods = set(summary_df["method"].astype(str).tolist())
+            required_grrnet = {"OFDM", "OFDMGRRNet", "Learned", "LearnedGRRNet"}
+            if required_grrnet.issubset(available_methods):
+                stage1_summary = _load_stage1_run_summary_markdown(config)
+                ofdm = summary_df[summary_df["method"] == "OFDM"].iloc[0]
+                ofdm_grr = summary_df[summary_df["method"] == "OFDMGRRNet"].iloc[0]
+                learned = summary_df[summary_df["method"] == "Learned"].iloc[0]
+                learned_grr = summary_df[summary_df["method"] == "LearnedGRRNet"].iloc[0]
+                lines: list[str] = []
+                if stage1_summary:
+                    lines.append(stage1_summary)
+                    lines.append("")
+                lines.append("**GRR-Net Stage 2 Summary**")
+                lines.append(
+                    f"- Stage 1 checkpoint source: `{config.stage2_checkpoint_source_path or config.stage2_checkpoint_path}`."
+                )
+                lines.append(
+                    f"- Stage 1 checkpoint snapshot: `{config.stage2_checkpoint_snapshot_path}`, "
+                    f"format `{config.stage2_checkpoint_format}`, payload hash `{config.stage2_checkpoint_hash_sha256}`, "
+                    f"file hash `{config.stage2_checkpoint_file_sha256}`, acceptance `{config.stage2_checkpoint_acceptance_passed}`."
+                )
+                lines.append(
+                    f"- Stage 2 training status: `{training_result.stop_reason}`."
+                )
+                lines.append(
+                    f"- GRR-Net mode: conditioned `{bool(getattr(config, 'grrnet_conditioned', True))}`, rank `{int(getattr(config, 'grrnet_rank', 16))}`."
+                )
+                for _, row in stage_summary_df.iterrows():
+                    best_epoch = int(row.get("best_stage_epoch", row["best_global_epoch"]))
+                    lines.append(
+                        f"- {row['scheme']} {row['stage']}: best epoch `{best_epoch}`, val BER `{row.get('val_ber', float('nan')):.4e}`, "
+                        f"val EVM `{row.get('val_evm', float('nan')):.4e}`, hard-CFO BER `{row.get('hard_cfo_weighted_ber', float('nan')):.4e}`."
+                    )
+                lines.append(
+                    f"- BER at CFO `0.00`: OFDM `{ofdm['ber_at_0']:.3e}`, OFDM + GRR-Net `{ofdm_grr['ber_at_0']:.3e}`, "
+                    f"Learned `{learned['ber_at_0']:.3e}`, Learned + GRR-Net `{learned_grr['ber_at_0']:.3e}`."
+                )
+                lines.append(
+                    f"- BER at CFO `0.05`: OFDM `{ofdm['ber_at_0p05']:.3e}`, OFDM + GRR-Net `{ofdm_grr['ber_at_0p05']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p05']:.3e}`, Learned + GRR-Net `{learned_grr['ber_at_0p05']:.3e}`."
+                )
+                lines.append(
+                    f"- BER at CFO `0.10`: OFDM `{ofdm['ber_at_0p10']:.3e}`, OFDM + GRR-Net `{ofdm_grr['ber_at_0p10']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p10']:.3e}`, Learned + GRR-Net `{learned_grr['ber_at_0p10']:.3e}`."
+                )
+                lines.append(
+                    f"- EVM at CFO `0.10`: OFDM `{ofdm['evm_at_0p10']:.4f}`, OFDM + GRR-Net `{ofdm_grr['evm_at_0p10']:.4f}`, "
+                    f"Learned `{learned['evm_at_0p10']:.4f}`, Learned + GRR-Net `{learned_grr['evm_at_0p10']:.4f}`."
+                )
+                lines.append(
+                    f"- Robustness window BER <= `0.01`: OFDM `{ofdm['robust_window_ber_le_0.01']:.3f}`, OFDM + GRR-Net `{ofdm_grr['robust_window_ber_le_0.01']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.01']:.3f}`, Learned + GRR-Net `{learned_grr['robust_window_ber_le_0.01']:.3f}`."
+                )
+                lines.append(
+                    f"- Robustness window BER <= `0.1`: OFDM `{ofdm['robust_window_ber_le_0.1']:.3f}`, OFDM + GRR-Net `{ofdm_grr['robust_window_ber_le_0.1']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.1']:.3f}`, Learned + GRR-Net `{learned_grr['robust_window_ber_le_0.1']:.3f}`."
+                )
+                return "\n".join(lines)
         if config.stage2_workflow == "USR_NET":
             available_methods = set(summary_df["method"].astype(str).tolist())
             required_usrnet = {"OFDM", "OFDMUSRNet", "Learned", "LearnedUSRNet"}
