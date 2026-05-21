@@ -49,6 +49,7 @@ METHOD_ORDER = (
     "LearnedNonlinear",
     "LearnedNonlinearOracleEps",
     "LearnedSpectral",
+    "LearnedPAPR",
 )
 METHOD_DISPLAY_NAMES = {
     "OFDM": "Classical OFDM",
@@ -59,6 +60,7 @@ METHOD_DISPLAY_NAMES = {
     "LearnedNonlinear": "Learned + Stage 2",
     "LearnedNonlinearOracleEps": "Learned + Stage 2 (True delta)",
     "LearnedSpectral": "Learned + Spectral Mask",
+    "LearnedPAPR": "Learned + PAPR Penalty",
 }
 METHOD_COLORS = {
     "OFDM": "#3A5F8A",
@@ -69,6 +71,7 @@ METHOD_COLORS = {
     "LearnedNonlinear": "#E39A5F",
     "LearnedNonlinearOracleEps": "#C74B50",
     "LearnedSpectral": "#2D8A5F",
+    "LearnedPAPR": "#5A8F29",
 }
 ORACLE_MMSE_SCALE_PREFIX = "LearnedOracleMMSEScale"
 ORACLE_MMSE_SCALE_COLORS = {
@@ -208,7 +211,7 @@ def transmitter_plot_method_order(
     if preferred_order is not None:
         return ordered_methods(available, preferred_order)
     order: list[str] = []
-    for pair in (("OFDM", "OFDMNonlinear"), ("Learned", "LearnedNonlinear"), ("LearnedSpectral",)):
+    for pair in (("OFDM", "OFDMNonlinear"), ("Learned", "LearnedNonlinear"), ("LearnedSpectral", "LearnedPAPR")):
         for method in pair:
             if method in available:
                 order.append(method)
@@ -1127,6 +1130,7 @@ def _summary_row_for_method(
     source_method: str,
     output_method: str,
     lambda_spec: float | None = None,
+    lambda_papr: float | None = None,
 ) -> dict[str, float | int | str | bool]:
     summary_row = result.summary_df[result.summary_df["method"] == source_method].iloc[0]
     spectral_row = result.spectral_summary_df[result.spectral_summary_df["method"] == source_method].iloc[0]
@@ -1147,10 +1151,16 @@ def _summary_row_for_method(
         "ber_at_0p05": float(summary_row["ber_at_0p05"]),
         "ber_at_0p10": float(summary_row["ber_at_0p10"]),
         "evm_at_0p10": float(summary_row["evm_at_0p10"]),
+        "clean_identity_loss": float(summary_row["clean_identity_loss"]),
+        "clean_offdiag_leakage": float(summary_row["clean_offdiag_leakage"]),
+        "stage1_acceptance_passed": bool(summary_row.get("stage1_acceptance_passed", not summary_row["stage_failed"])),
         "occupied_bandwidth": float(spectral_row["occupied_bandwidth"]),
         "out_of_band_power_ratio": float(spectral_row["out_of_band_power_ratio"]),
+        "papr_mean_db": float(papr_row["papr_mean_db"]),
         "papr_p95_db": float(papr_row["papr_p95_db"]),
+        "papr_max_db": float(papr_row["papr_max_db"]),
         "lambda_spec": float(lambda_spec) if lambda_spec is not None else np.nan,
+        "lambda_papr": float(lambda_papr) if lambda_papr is not None else np.nan,
     }
     for col in summary_row.index:
         if isinstance(col, str) and col.startswith("robust_window_"):
@@ -1201,6 +1211,211 @@ def build_spectral_constraint_comparison_summary(
             )
         )
     return pd.DataFrame(rows)
+
+
+def build_papr_constraint_trial_summary(
+    modulation: str,
+    constrained_results: list[tuple[float, ExperimentResult]],
+) -> pd.DataFrame:
+    rows: list[dict[str, float | int | str | bool]] = []
+    for lambda_papr, result in constrained_results:
+        learned = _summary_row_for_method(
+            result=result,
+            source_method="Learned",
+            output_method="LearnedPAPR",
+            lambda_papr=lambda_papr,
+        )
+        learned["modulation"] = modulation
+        rows.append(learned)
+    return pd.DataFrame(rows).sort_values("lambda_papr", kind="stable").reset_index(drop=True)
+
+
+def build_papr_constraint_comparison_summary(
+    baseline_result: ExperimentResult,
+    best_constrained_result: ExperimentResult | None,
+    best_lambda_papr: float | None,
+) -> pd.DataFrame:
+    rows = [
+        _summary_row_for_method(baseline_result, "OFDM", "OFDM"),
+        _summary_row_for_method(baseline_result, "Learned", "Learned"),
+    ]
+    if best_constrained_result is not None and best_lambda_papr is not None:
+        rows.append(
+            _summary_row_for_method(
+                best_constrained_result,
+                "Learned",
+                "LearnedPAPR",
+                lambda_papr=best_lambda_papr,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def build_papr_constraint_tradeoff_df(
+    trial_summary_df: pd.DataFrame,
+    comparison_summary_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if trial_summary_df.empty:
+        return trial_summary_df.copy()
+
+    learned_baseline = comparison_summary_df[comparison_summary_df["method"] == "Learned"].iloc[0]
+    ofdm_baseline = comparison_summary_df[comparison_summary_df["method"] == "OFDM"].iloc[0]
+    tradeoff_df = trial_summary_df.copy()
+    tradeoff_df["delta_integrated_log10_ber_vs_learned"] = (
+        tradeoff_df["integrated_log10_ber"] - float(learned_baseline["integrated_log10_ber"])
+    )
+    tradeoff_df["delta_papr_p95_db_vs_learned"] = (
+        tradeoff_df["papr_p95_db"] - float(learned_baseline["papr_p95_db"])
+    )
+    tradeoff_df["delta_papr_mean_db_vs_learned"] = (
+        tradeoff_df["papr_mean_db"] - float(learned_baseline["papr_mean_db"])
+    )
+    tradeoff_df["delta_ber_at_0_vs_learned"] = tradeoff_df["ber_at_0"] - float(learned_baseline["ber_at_0"])
+    tradeoff_df["delta_ber_at_0p05_vs_learned"] = (
+        tradeoff_df["ber_at_0p05"] - float(learned_baseline["ber_at_0p05"])
+    )
+    tradeoff_df["delta_ber_at_0p10_vs_learned"] = (
+        tradeoff_df["ber_at_0p10"] - float(learned_baseline["ber_at_0p10"])
+    )
+    tradeoff_df["delta_oob_power_vs_learned"] = (
+        tradeoff_df["out_of_band_power_ratio"] - float(learned_baseline["out_of_band_power_ratio"])
+    )
+    tradeoff_df["delta_occupied_bw_vs_learned"] = (
+        tradeoff_df["occupied_bandwidth"] - float(learned_baseline["occupied_bandwidth"])
+    )
+    tradeoff_df["delta_clean_identity_vs_learned"] = (
+        tradeoff_df["clean_identity_loss"] - float(learned_baseline["clean_identity_loss"])
+    )
+    tradeoff_df["delta_clean_offdiag_vs_learned"] = (
+        tradeoff_df["clean_offdiag_leakage"] - float(learned_baseline["clean_offdiag_leakage"])
+    )
+    tradeoff_df["delta_papr_p95_db_vs_ofdm"] = (
+        tradeoff_df["papr_p95_db"] - float(ofdm_baseline["papr_p95_db"])
+    )
+    return tradeoff_df.sort_values("lambda_papr", kind="stable").reset_index(drop=True)
+
+
+def plot_papr_constraint_tradeoff(
+    tradeoff_df: pd.DataFrame,
+    comparison_summary_df: pd.DataFrame,
+    path: Path,
+) -> Path | None:
+    if tradeoff_df.empty:
+        return None
+
+    learned_baseline = comparison_summary_df[comparison_summary_df["method"] == "Learned"].iloc[0]
+    ofdm_baseline = comparison_summary_df[comparison_summary_df["method"] == "OFDM"].iloc[0]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.2), dpi=130, constrained_layout=True)
+    axes = axes.ravel()
+
+    accepted = tradeoff_df["stage1_acceptance_passed"].to_numpy(dtype=bool)
+    accepted_color = "#2D8A5F"
+    failed_color = "#C74B50"
+    point_colors = np.where(accepted, accepted_color, failed_color)
+
+    axes[0].plot(
+        tradeoff_df["lambda_papr"],
+        tradeoff_df["integrated_log10_ber"],
+        color="#444444",
+        linewidth=1.2,
+        alpha=0.8,
+    )
+    axes[0].scatter(
+        tradeoff_df["lambda_papr"],
+        tradeoff_df["integrated_log10_ber"],
+        c=point_colors,
+        s=42,
+        zorder=3,
+    )
+    axes[0].axhline(float(learned_baseline["integrated_log10_ber"]), color=method_color("Learned"), linestyle="--", linewidth=1.2)
+    axes[0].axhline(float(ofdm_baseline["integrated_log10_ber"]), color=method_color("OFDM"), linestyle=":", linewidth=1.2)
+    axes[0].set_xscale("log")
+    axes[0].set_title("BER robustness vs lambda")
+    axes[0].set_xlabel(r"$\lambda_{\mathrm{papr}}$")
+    axes[0].set_ylabel("Integrated log10 BER")
+    axes[0].grid(True, which="both", alpha=0.3)
+
+    axes[1].plot(
+        tradeoff_df["lambda_papr"],
+        tradeoff_df["papr_p95_db"],
+        color="#444444",
+        linewidth=1.2,
+        alpha=0.8,
+    )
+    axes[1].scatter(
+        tradeoff_df["lambda_papr"],
+        tradeoff_df["papr_p95_db"],
+        c=point_colors,
+        s=42,
+        zorder=3,
+    )
+    axes[1].axhline(float(learned_baseline["papr_p95_db"]), color=method_color("Learned"), linestyle="--", linewidth=1.2)
+    axes[1].axhline(float(ofdm_baseline["papr_p95_db"]), color=method_color("OFDM"), linestyle=":", linewidth=1.2)
+    axes[1].set_xscale("log")
+    axes[1].set_title("PAPR p95 vs lambda")
+    axes[1].set_xlabel(r"$\lambda_{\mathrm{papr}}$")
+    axes[1].set_ylabel("PAPR p95 [dB]")
+    axes[1].grid(True, which="both", alpha=0.3)
+
+    axes[2].scatter(
+        tradeoff_df["papr_p95_db"],
+        tradeoff_df["integrated_log10_ber"],
+        c=point_colors,
+        s=52,
+        zorder=3,
+    )
+    axes[2].scatter(
+        [float(learned_baseline["papr_p95_db"])],
+        [float(learned_baseline["integrated_log10_ber"])],
+        color=method_color("Learned"),
+        marker="s",
+        s=64,
+        label="Learned baseline",
+        zorder=4,
+    )
+    axes[2].scatter(
+        [float(ofdm_baseline["papr_p95_db"])],
+        [float(ofdm_baseline["integrated_log10_ber"])],
+        color=method_color("OFDM"),
+        marker="^",
+        s=64,
+        label="OFDM",
+        zorder=4,
+    )
+    for _, row in tradeoff_df.iterrows():
+        axes[2].annotate(
+            f"{float(row['lambda_papr']):.0e}",
+            (float(row["papr_p95_db"]), float(row["integrated_log10_ber"])),
+            textcoords="offset points",
+            xytext=(5, 4),
+            fontsize=8,
+        )
+    axes[2].set_title("PAPR-BER tradeoff")
+    axes[2].set_xlabel("PAPR p95 [dB]")
+    axes[2].set_ylabel("Integrated log10 BER")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
+
+    axes[3].plot(
+        tradeoff_df["lambda_papr"],
+        tradeoff_df["out_of_band_power_ratio"],
+        color=method_color("LearnedPAPR"),
+        linewidth=1.8,
+        marker="o",
+    )
+    axes[3].axhline(float(learned_baseline["out_of_band_power_ratio"]), color=method_color("Learned"), linestyle="--", linewidth=1.2)
+    axes[3].axhline(float(ofdm_baseline["out_of_band_power_ratio"]), color=method_color("OFDM"), linestyle=":", linewidth=1.2)
+    axes[3].set_xscale("log")
+    axes[3].set_yscale("log")
+    axes[3].set_title("Spectral spillover vs lambda")
+    axes[3].set_xlabel(r"$\lambda_{\mathrm{papr}}$")
+    axes[3].set_ylabel("Out-of-band power ratio")
+    axes[3].grid(True, which="both", alpha=0.3)
+
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
 
 def plot_ber_curve_multi(
@@ -1382,6 +1597,106 @@ def save_spectral_constraint_artifacts(
     return paths
 
 
+def save_papr_constraint_artifacts(
+    output_dir: Path,
+    baseline_result: ExperimentResult,
+    constrained_results: list[tuple[float, ExperimentResult]],
+    constrained_trial_df: pd.DataFrame,
+    comparison_summary_df: pd.DataFrame,
+    best_constrained_result: ExperimentResult | None,
+    best_lambda_papr: float | None,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "trial_summary_csv": output_dir / "papr_constraint_trial_summary.csv",
+        "comparison_summary_csv": output_dir / "papr_constraint_comparison_summary.csv",
+    }
+    constrained_trial_df.to_csv(paths["trial_summary_csv"], index=False)
+    comparison_summary_df.to_csv(paths["comparison_summary_csv"], index=False)
+    tradeoff_df = build_papr_constraint_tradeoff_df(constrained_trial_df, comparison_summary_df)
+    paths["tradeoff_csv"] = output_dir / "papr_constraint_tradeoff_summary.csv"
+    tradeoff_df.to_csv(paths["tradeoff_csv"], index=False)
+    tradeoff_plot = plot_papr_constraint_tradeoff(
+        tradeoff_df=tradeoff_df,
+        comparison_summary_df=comparison_summary_df,
+        path=output_dir / "papr_constraint_tradeoff.png",
+    )
+    if tradeoff_plot is not None:
+        paths["tradeoff_plot"] = tradeoff_plot
+
+    all_trial_rows = []
+    for lambda_papr, result in constrained_results:
+        frame = result.summary_df.copy()
+        frame["lambda_papr"] = lambda_papr
+        all_trial_rows.append(frame)
+    if all_trial_rows:
+        paths["trial_raw_csv"] = output_dir / "papr_constraint_trial_raw_summary.csv"
+        pd.concat(all_trial_rows, ignore_index=True).to_csv(paths["trial_raw_csv"], index=False)
+
+    if best_constrained_result is None or best_lambda_papr is None:
+        return paths
+
+    comparison_ber_df = pd.concat(
+        [
+            _relabel_method_frame(baseline_result.ber_df, "OFDM", "OFDM"),
+            _relabel_method_frame(baseline_result.ber_df, "Learned", "Learned"),
+            _relabel_method_frame(best_constrained_result.ber_df, "Learned", "LearnedPAPR"),
+        ],
+        ignore_index=True,
+    )
+    comparison_spectral_df = pd.concat(
+        [
+            _relabel_method_frame(baseline_result.spectral_df, "OFDM", "OFDM"),
+            _relabel_method_frame(baseline_result.spectral_df, "Learned", "Learned"),
+            _relabel_method_frame(best_constrained_result.spectral_df, "Learned", "LearnedPAPR"),
+        ],
+        ignore_index=True,
+    )
+    comparison_papr_df = pd.concat(
+        [
+            _relabel_method_frame(baseline_result.papr_df, "OFDM", "OFDM"),
+            _relabel_method_frame(baseline_result.papr_df, "Learned", "Learned"),
+            _relabel_method_frame(best_constrained_result.papr_df, "Learned", "LearnedPAPR"),
+        ],
+        ignore_index=True,
+    )
+
+    paths["comparison_ber_csv"] = output_dir / "papr_constraint_comparison_ber_vs_cfo.csv"
+    comparison_ber_df.to_csv(paths["comparison_ber_csv"], index=False)
+    paths["comparison_spectral_csv"] = output_dir / "papr_constraint_comparison_spectral_psd.csv"
+    comparison_spectral_df.to_csv(paths["comparison_spectral_csv"], index=False)
+    paths["comparison_papr_csv"] = output_dir / "papr_constraint_comparison_papr_samples.csv"
+    comparison_papr_df.to_csv(paths["comparison_papr_csv"], index=False)
+
+    ber_plot = plot_ber_curve_multi(
+        ber_df=comparison_ber_df,
+        method_order=("OFDM", "Learned", "LearnedPAPR"),
+        title=(
+            f"BER vs residual CFO | {baseline_result.summary_df.iloc[0]['modulation']}, "
+            f"N={baseline_result.summary_df.iloc[0]['N']}, M={baseline_result.summary_df.iloc[0]['M']}"
+        ),
+        path=output_dir / "papr_constraint_comparison_ber_vs_cfo.png",
+    )
+    if ber_plot is not None:
+        paths["comparison_ber_plot"] = ber_plot
+
+    spectral_plot = plot_spectral_fairness_multi(
+        n=int(baseline_result.summary_df.iloc[0]["N"]),
+        m=int(baseline_result.summary_df.iloc[0]["M"]),
+        spectral_df=comparison_spectral_df,
+        papr_df=comparison_papr_df,
+        method_order=("OFDM", "Learned", "LearnedPAPR"),
+        title=(
+            f"PAPR-regularization comparison | {baseline_result.summary_df.iloc[0]['modulation']}, "
+            f"best lambda={best_lambda_papr:.1e}"
+        ),
+        path=output_dir / "papr_constraint_comparison_spectral_fairness.png",
+    )
+    if spectral_plot is not None:
+        paths["comparison_spectral_plot"] = spectral_plot
+    return paths
+
+
 def plot_training_diagnostics(config: ExperimentConfig, history_df: pd.DataFrame) -> Path:
     path = config.output_dir / "training_diagnostics.png"
     if "clean_offdiag_leakage" not in history_df.columns:
@@ -1452,6 +1767,8 @@ def plot_training_diagnostics(config: ExperimentConfig, history_df: pd.DataFrame
         component_keys.append("train_Lnn")
     if "train_Lspec" in history_df.columns and np.any(np.abs(history_df["train_Lspec"].to_numpy()) > 1e-12):
         component_keys.append("train_Lspec")
+    if "train_Lpapr" in history_df.columns and np.any(np.abs(history_df["train_Lpapr"].to_numpy()) > 1e-12):
+        component_keys.append("train_Lpapr")
     for key in component_keys:
         axes[1].plot(history_df["global_epoch"], history_df[key], linewidth=2, label=key.replace("train_", ""))
     axes[1].set_title("Loss components")
@@ -1555,6 +1872,8 @@ def plot_training_loss_components(config: ExperimentConfig, history_df: pd.DataF
         ("train_Ldiag", r"$L_{\mathrm{diag}}$"),
         ("train_Lnn", r"$L_{\mathrm{nn}}$"),
         ("train_Lsym", r"$L_{\mathrm{sym}}$"),
+        ("train_Lspec", r"$L_{\mathrm{spec}}$"),
+        ("train_Lpapr", r"$L_{\mathrm{papr}}$"),
         ("rx_fro_norm_sq", r"$||V||_F^2$"),
     ]
     for key, label in component_specs:

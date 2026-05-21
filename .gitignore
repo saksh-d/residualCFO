@@ -5,6 +5,7 @@ stage2_nonlinear_outputs/
 stage2_oracle_diagnostics/
 smoke_stage2_outputs/
 stage2_blind_outputs/
+stage1_papr_sidecar_outputs/
 side/oracle_diagnostics/
 
 # Ignore DS_store folder and macOS DS_Store files

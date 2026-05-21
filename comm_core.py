@@ -73,6 +73,9 @@ class ExperimentConfig:
     spectral_constraint_enabled: bool = False
     lambda_spec: float = 0.0
     spectral_guard_bins: int = 1
+    papr_constraint_enabled: bool = False
+    lambda_papr: float = 0.0
+    papr_smoothmax_beta: float = 10.0
     history_log_interval: int = 25
     stage_validation_points: int = 9
     stage_a_identity_tol: float = 5e-3
@@ -237,6 +240,10 @@ class ExperimentConfig:
                     )
         if self.stage2_hidden_multiplier < 1:
             raise ValueError("stage2_hidden_multiplier must be at least 1.")
+        if self.lambda_papr < 0.0:
+            raise ValueError("lambda_papr must be non-negative.")
+        if self.papr_smoothmax_beta <= 0.0:
+            raise ValueError("papr_smoothmax_beta must be positive.")
         if self.stage2_local_channels < 1:
             raise ValueError("stage2_local_channels must be at least 1.")
         if self.stage2_local_kernel_size < 1 or self.stage2_local_kernel_size % 2 == 0:
@@ -388,6 +395,17 @@ class SpectralConstraintResult:
     artifact_paths: dict[str, Path]
     lambda_spec_values: tuple[float, ...]
     best_lambda_spec: float | None
+
+
+@dataclass
+class PAPRConstraintResult:
+    baseline_result: ExperimentResult
+    best_constrained_result: ExperimentResult | None
+    constrained_trial_df: pd.DataFrame
+    comparison_summary_df: pd.DataFrame
+    artifact_paths: dict[str, Path]
+    lambda_papr_values: tuple[float, ...]
+    best_lambda_papr: float | None
 
 
 @dataclass
@@ -1061,6 +1079,100 @@ def run_spectral_constraint_sidecar(
         artifact_paths=artifact_paths,
         lambda_spec_values=lambda_spec_values,
         best_lambda_spec=best_lambda_spec,
+    )
+
+
+def run_papr_constraint_sidecar(
+    base_config: ExperimentConfig,
+    lambda_papr_values: tuple[float, ...] = (1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3),
+) -> PAPRConstraintResult:
+    from reporting import (
+        build_papr_constraint_comparison_summary,
+        build_papr_constraint_trial_summary,
+        save_papr_constraint_artifacts,
+    )
+
+    lambda_papr_values = tuple(float(value) for value in lambda_papr_values)
+    if not lambda_papr_values:
+        raise ValueError("lambda_papr_values must contain at least one penalty value.")
+
+    root_dir = base_config.output_dir
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_config = replace(
+        base_config,
+        papr_constraint_enabled=False,
+        lambda_papr=0.0,
+        refresh_output_dir=True,
+        output_dir=root_dir / "baseline",
+    )
+    baseline_result = run_full_experiment(config=baseline_config)
+
+    constrained_results: list[tuple[float, ExperimentResult]] = []
+    for run_idx, lambda_papr in enumerate(lambda_papr_values):
+        lambda_tag = f"{lambda_papr:.0e}".replace("+", "")
+        constrained_config = replace(
+            base_config,
+            base_seed=base_config.base_seed + 30_000 * (run_idx + 1),
+            papr_constraint_enabled=True,
+            lambda_papr=lambda_papr,
+            refresh_output_dir=True,
+            output_dir=root_dir / f"constrained_lambda_{lambda_tag}",
+        )
+        constrained_results.append((lambda_papr, run_full_experiment(config=constrained_config)))
+
+    constrained_trial_df = build_papr_constraint_trial_summary(
+        modulation=base_config.modulation,
+        constrained_results=constrained_results,
+    )
+
+    best_lambda_papr: float | None = None
+    best_constrained_result: ExperimentResult | None = None
+    passing_trials = constrained_trial_df[
+        constrained_trial_df["stage1_acceptance_passed"] & ~constrained_trial_df["stage_failed"]
+    ]
+    if not passing_trials.empty:
+        best_row = passing_trials.sort_values(
+            ["integrated_log10_ber", "papr_p95_db"],
+            kind="stable",
+        ).iloc[0]
+    elif not constrained_trial_df.empty:
+        best_row = constrained_trial_df.sort_values(
+            ["integrated_log10_ber", "papr_p95_db"],
+            kind="stable",
+        ).iloc[0]
+    else:
+        best_row = None
+    if best_row is not None:
+        best_lambda_papr = float(best_row["lambda_papr"])
+        for lambda_papr, result in constrained_results:
+            if abs(lambda_papr - best_lambda_papr) < 1e-18:
+                best_constrained_result = result
+                break
+
+    comparison_summary_df = build_papr_constraint_comparison_summary(
+        baseline_result=baseline_result,
+        best_constrained_result=best_constrained_result,
+        best_lambda_papr=best_lambda_papr,
+    )
+    artifact_paths = save_papr_constraint_artifacts(
+        output_dir=root_dir,
+        baseline_result=baseline_result,
+        constrained_results=constrained_results,
+        constrained_trial_df=constrained_trial_df,
+        comparison_summary_df=comparison_summary_df,
+        best_constrained_result=best_constrained_result,
+        best_lambda_papr=best_lambda_papr,
+    )
+
+    return PAPRConstraintResult(
+        baseline_result=baseline_result,
+        best_constrained_result=best_constrained_result,
+        constrained_trial_df=constrained_trial_df,
+        comparison_summary_df=comparison_summary_df,
+        artifact_paths=artifact_paths,
+        lambda_papr_values=lambda_papr_values,
+        best_lambda_papr=best_lambda_papr,
     )
 
 

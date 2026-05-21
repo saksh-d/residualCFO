@@ -277,6 +277,20 @@ def spectral_mask_loss(tx_basis: torch.Tensor, config: ExperimentConfig) -> torc
     return (outside_energy / total_energy).to(torch.float32)
 
 
+def papr_smooth_loss(tx_basis: torch.Tensor, symbols: torch.Tensor, config: ExperimentConfig) -> torch.Tensor:
+    if not config.papr_constraint_enabled or config.lambda_papr <= 0.0:
+        return torch.zeros((), device=tx_basis.device, dtype=torch.float32)
+
+    tx_signal = transmit_symbols(symbols, tx_basis)
+    power = torch.abs(tx_signal) ** 2
+    normalized_power = power / power.mean(dim=1, keepdim=True).clamp_min(1e-12)
+    beta = float(config.papr_smoothmax_beta)
+    smooth_peak = (
+        torch.logsumexp(beta * normalized_power, dim=1) - math.log(float(tx_signal.shape[1]))
+    ) / beta
+    return smooth_peak.mean().to(torch.float32)
+
+
 def offdiag_leakage_ratio(operator: torch.Tensor) -> torch.Tensor:
     if operator.ndim == 2:
         operator = operator.unsqueeze(0)
@@ -466,6 +480,7 @@ def _stage_total_loss(
     operator_clean: torch.Tensor,
     operator_cfo: torch.Tensor,
     rx_basis: torch.Tensor,
+    symbols: torch.Tensor,
     symbol_loss: torch.Tensor,
     use_cfo_losses: bool,
     operator_loss_weights: torch.Tensor | None = None,
@@ -473,6 +488,7 @@ def _stage_total_loss(
     loss_0 = identity_loss(operator_clean)
     loss_v = receiver_fro_loss(rx_basis)
     loss_spec = spectral_mask_loss(tx_basis, config)
+    loss_papr = papr_smooth_loss(tx_basis, symbols, config)
     if use_cfo_losses:
         loss_off = offdiag_energy_loss(
             operator_cfo,
@@ -498,6 +514,7 @@ def _stage_total_loss(
         + config.lambda_sym * symbol_loss
         + config.lambda_nn * loss_nn
         + config.lambda_spec * loss_spec
+        + config.lambda_papr * loss_papr
     )
     return total, {
         "L0": loss_0,
@@ -507,6 +524,7 @@ def _stage_total_loss(
         "Lsym": symbol_loss,
         "Lnn": loss_nn,
         "Lspec": loss_spec,
+        "Lpapr": loss_papr,
     }
 
 
@@ -920,6 +938,7 @@ def train_feasibility_model(
                 operator_clean=operator_clean,
                 operator_cfo=operator_cfo,
                 rx_basis=rx_basis,
+                symbols=symbols,
                 symbol_loss=loss_sym,
                 use_cfo_losses=stage.use_cfo_losses,
                 operator_loss_weights=operator_loss_weights,
@@ -957,6 +976,7 @@ def train_feasibility_model(
                     operator_clean=operator_clean_val,
                     operator_cfo=operator_stage_val,
                     rx_basis=rx_val,
+                    symbols=val_symbols,
                     symbol_loss=val_symbol_loss,
                     use_cfo_losses=stage.use_cfo_losses,
                     operator_loss_weights=validation_weights,
@@ -981,6 +1001,7 @@ def train_feasibility_model(
                         "train_Lsym": components["Lsym"].item(),
                         "train_Lnn": components["Lnn"].item(),
                         "train_Lspec": components["Lspec"].item(),
+                        "train_Lpapr": components["Lpapr"].item(),
                         "val_total": val_total.item(),
                         "val_L0": val_components["L0"].item(),
                         "val_Loff": val_components["Loff"].item(),
@@ -989,6 +1010,7 @@ def train_feasibility_model(
                         "val_Lsym": val_components["Lsym"].item(),
                         "val_Lnn": val_components["Lnn"].item(),
                         "val_Lspec": val_components["Lspec"].item(),
+                        "val_Lpapr": val_components["Lpapr"].item(),
                         "clean_offdiag_leakage": clean_leakage,
                         "rx_fro_norm_sq": receiver_fro_loss(rx_val).item(),
                         "elapsed_s": perf_counter() - t0,
@@ -1051,6 +1073,7 @@ def train_feasibility_model(
                 ).mean().item(),
                 "validation_symbol_loss": stage_symbol_loss,
                 "validation_spectral_loss": stage_spectral_loss,
+                "validation_papr_loss": papr_smooth_loss(tx_final, val_symbols, config).item(),
                 "receiver_fro_norm_sq": receiver_fro_loss(rx_final).item(),
                 "stage_failed": False,
                 "stop_reason": "",
