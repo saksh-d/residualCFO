@@ -53,12 +53,12 @@ METHOD_ORDER = (
 METHOD_DISPLAY_NAMES = {
     "OFDM": "Classical OFDM",
     "OFDMNonlinear": "OFDM + Stage 2",
-    "OFDMUSRNet": "OFDM + USR-Net",
+    "OFDMUSRNet": "OFDM + Neural-USR",
     "Learned": "Learned Basis",
     "LearnedOraclePreV": "Learned + Oracle Pre-V CFO",
     "LearnedOracleMMSE": "Learned + Oracle MMSE",
     "LearnedNonlinear": "Learned + Stage 2",
-    "LearnedUSRNet": "Learned + USR-Net",
+    "LearnedUSRNet": "Learned + Neural-USR",
     "LearnedNonlinearOracleEps": "Learned + Stage 2 (True delta)",
     "LearnedSpectral": "Learned + Spectral Mask",
 }
@@ -2142,15 +2142,15 @@ def build_mapping_markdown(config: ExperimentConfig) -> str:
         if getattr(config, "stage2_workflow", "").upper() == "USR_NET":
             return "\n".join(
                 [
-                    "**USR-Net Post-V Symbol Refinement**",
+                    "**Neural-USR Post-V Symbol Refinement**",
                     "",
-                    rf"$z_0 = V y,\quad \hat{{A}}(c_b) = V\Phi(c_b)W,\quad r_t = D_t(c_b)^{{-1}} z_0,\quad \hat{{s}}^{{(t+1)}} = (1-\rho_t)\hat{{s}}^{{(t)}} + \rho_t\left(r_t + \alpha_t \Delta_t\right)$",
+                    rf"$z_0 = V y,\quad \hat{{A}}(c_b) = V\Phi(c_b)W,\quad s_0 = r_{{\mathrm{{core}}}},\quad r_t = D_t(c_b)^{{-1}} z_0,\quad \hat{{s}}^{{(t+1)}} = \hat{{s}}^{{(t)}} + \eta_t \Delta_t,\quad \hat{{s}} = \hat{{s}}^{{(3)}}$",
                     "",
                     "- The Stage 1 linear front end remains frozen and interpretable.",
-                    "- USR-Net is a three-layer unfolded symbol refinement network with model-guided correction anchors and learned residual dilated convolutional refinement blocks.",
-                    "- The block condition `c_b` is a receiver-state condition used only to build the diagonal anchor from the fixed operator `A_hat(c_b) = V Phi(c_b) W`.",
-                    "- The main path uses only the diagonal of `A_hat(c_b)`; it does not apply off-diagonal MMSE-style cancellation in the practical receiver.",
-                    "- The learned residual branch is explicitly bounded through small `alpha_t` coefficients so the network can stay close to the stable diagonal anchor when that is optimal.",
+                    "- Neural-USR uses the model-guided diagonal reference only to initialize and condition the unfolded network.",
+                    "- The final detector output is produced by three learned unfolded neural update layers, not by direct anchor replacement.",
+                    "- The block condition `c_b` is used only to build the diagonal reference from the fixed operator `A_hat(c_b) = V Phi(c_b) W`.",
+                    "- The main path uses only diagonal conditioning information; it does not apply off-diagonal MMSE-style cancellation in the practical receiver.",
                 ]
             )
         if getattr(config, "stage2_sideinfo_enabled", False):
@@ -2248,7 +2248,7 @@ def build_summary_markdown(
                 if stage1_summary:
                     lines.append(stage1_summary)
                     lines.append("")
-                lines.append("**USR-Net Stage 2 Summary**")
+                lines.append("**Neural-USR Stage 2 Summary**")
                 lines.append(
                     f"- Stage 1 checkpoint source: `{config.stage2_checkpoint_source_path or config.stage2_checkpoint_path}`."
                 )
@@ -2267,28 +2267,28 @@ def build_summary_markdown(
                         f"hard-CFO BER `{row['hard_cfo_weighted_ber']:.4e}`, guard `{row['guard_loss']:.4e}`."
                     )
                 lines.append(
-                    f"- BER at CFO `0.00`: OFDM `{ofdm['ber_at_0']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0']:.3e}`, "
-                    f"Learned `{learned['ber_at_0']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0']:.3e}`."
+                    f"- BER at CFO `0.00`: OFDM `{ofdm['ber_at_0']:.3e}`, OFDM + Neural-USR `{ofdm_usr['ber_at_0']:.3e}`, "
+                    f"Learned `{learned['ber_at_0']:.3e}`, Learned + Neural-USR `{learned_usr['ber_at_0']:.3e}`."
                 )
                 lines.append(
-                    f"- BER at CFO `0.05`: OFDM `{ofdm['ber_at_0p05']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0p05']:.3e}`, "
-                    f"Learned `{learned['ber_at_0p05']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0p05']:.3e}`."
+                    f"- BER at CFO `0.05`: OFDM `{ofdm['ber_at_0p05']:.3e}`, OFDM + Neural-USR `{ofdm_usr['ber_at_0p05']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p05']:.3e}`, Learned + Neural-USR `{learned_usr['ber_at_0p05']:.3e}`."
                 )
                 lines.append(
-                    f"- BER at CFO `0.10`: OFDM `{ofdm['ber_at_0p10']:.3e}`, OFDM + USR-Net `{ofdm_usr['ber_at_0p10']:.3e}`, "
-                    f"Learned `{learned['ber_at_0p10']:.3e}`, Learned + USR-Net `{learned_usr['ber_at_0p10']:.3e}`."
+                    f"- BER at CFO `0.10`: OFDM `{ofdm['ber_at_0p10']:.3e}`, OFDM + Neural-USR `{ofdm_usr['ber_at_0p10']:.3e}`, "
+                    f"Learned `{learned['ber_at_0p10']:.3e}`, Learned + Neural-USR `{learned_usr['ber_at_0p10']:.3e}`."
                 )
                 lines.append(
-                    f"- EVM at CFO `0.10`: OFDM `{ofdm['evm_at_0p10']:.4f}`, OFDM + USR-Net `{ofdm_usr['evm_at_0p10']:.4f}`, "
-                    f"Learned `{learned['evm_at_0p10']:.4f}`, Learned + USR-Net `{learned_usr['evm_at_0p10']:.4f}`."
+                    f"- EVM at CFO `0.10`: OFDM `{ofdm['evm_at_0p10']:.4f}`, OFDM + Neural-USR `{ofdm_usr['evm_at_0p10']:.4f}`, "
+                    f"Learned `{learned['evm_at_0p10']:.4f}`, Learned + Neural-USR `{learned_usr['evm_at_0p10']:.4f}`."
                 )
                 lines.append(
-                    f"- Robustness window BER <= `0.01`: OFDM `{ofdm['robust_window_ber_le_0.01']:.3f}`, OFDM + USR-Net `{ofdm_usr['robust_window_ber_le_0.01']:.3f}`, "
-                    f"Learned `{learned['robust_window_ber_le_0.01']:.3f}`, Learned + USR-Net `{learned_usr['robust_window_ber_le_0.01']:.3f}`."
+                    f"- Robustness window BER <= `0.01`: OFDM `{ofdm['robust_window_ber_le_0.01']:.3f}`, OFDM + Neural-USR `{ofdm_usr['robust_window_ber_le_0.01']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.01']:.3f}`, Learned + Neural-USR `{learned_usr['robust_window_ber_le_0.01']:.3f}`."
                 )
                 lines.append(
-                    f"- Robustness window BER <= `0.1`: OFDM `{ofdm['robust_window_ber_le_0.1']:.3f}`, OFDM + USR-Net `{ofdm_usr['robust_window_ber_le_0.1']:.3f}`, "
-                    f"Learned `{learned['robust_window_ber_le_0.1']:.3f}`, Learned + USR-Net `{learned_usr['robust_window_ber_le_0.1']:.3f}`."
+                    f"- Robustness window BER <= `0.1`: OFDM `{ofdm['robust_window_ber_le_0.1']:.3f}`, OFDM + Neural-USR `{ofdm_usr['robust_window_ber_le_0.1']:.3f}`, "
+                    f"Learned `{learned['robust_window_ber_le_0.1']:.3f}`, Learned + Neural-USR `{learned_usr['robust_window_ber_le_0.1']:.3f}`."
                 )
                 return "\n".join(lines)
 

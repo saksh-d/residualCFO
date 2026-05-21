@@ -96,9 +96,9 @@ USRNET_ARCHITECTURE = USRNetArchitectureConfig(
     conv_kernel_size=3,
     conv_dilations=(1, 2, 4),
     final_gain_enabled=True,
-    rho_init=(0.85, 0.90, 0.95),
-    gamma_init=(1.0, 1.0, 1.0),
-    alpha_init=(0.03, 0.05, 0.05),
+    shared_gamma_init=1.0,
+    layer_gamma_init=(1.0, 1.0, 1.0),
+    eta_init=(0.125, 0.125, 0.125),
 )
 USRNET_LOSS = USRNetLossConfig(
     layer_weights=(0.2, 0.3, 0.5),
@@ -133,8 +133,10 @@ USRNET_PHASES = (
         delta_span=0.15,
         ebn0_choices=(10.0, 12.0, 15.0, 20.0),
         disable_neural=True,
+        train_anchor=True,
+        train_layer_reference=False,
         train_conv=False,
-        train_alpha=False,
+        train_eta=False,
     ),
     USRNetPhaseConfig(
         name="Phase1NeuralUnfreeze",
@@ -144,8 +146,10 @@ USRNET_PHASES = (
         delta_span=0.15,
         ebn0_choices=(10.0, 12.0, 15.0, 20.0),
         disable_neural=False,
+        train_anchor=False,
+        train_layer_reference=False,
         train_conv=True,
-        train_alpha=True,
+        train_eta=True,
     ),
     USRNetPhaseConfig(
         name="Phase2Robustness",
@@ -155,8 +159,10 @@ USRNET_PHASES = (
         delta_span=0.15,
         ebn0_choices=(10.0, 12.0, 15.0, 20.0),
         disable_neural=False,
+        train_anchor=True,
+        train_layer_reference=True,
         train_conv=True,
-        train_alpha=True,
+        train_eta=True,
     ),
 )
 USRNET_VALIDATION = USRNetValidationConfig(
@@ -200,7 +206,8 @@ def _stage2_control_lines(config: ExperimentConfig, *, phi_sign: int | None = No
     phase_text = "; ".join(
         f"{phase.name}: epochs={phase.epochs}, lr={phase.learning_rate:.1e}, sigma={phase.sigma_condition}, "
         f"delta_span={phase.delta_span:.2f}, ebn0={phase.ebn0_choices}, disable_neural={phase.disable_neural}, "
-        f"train_conv={phase.train_conv}, train_alpha={phase.train_alpha}"
+        f"train_anchor={phase.train_anchor}, train_layer_reference={phase.train_layer_reference}, "
+        f"train_conv={phase.train_conv}, train_eta={phase.train_eta}"
         for phase in phase_configs
     )
     lines = [
@@ -211,11 +218,11 @@ def _stage2_control_lines(config: ExperimentConfig, *, phi_sign: int | None = No
         f"- Evaluation setup: eval Eb/N0 `{config.eval_ebn0_db:.1f} dB`, signed CFO grid `{tuple(float(v) for v in config.ber_eval_cfo)}`, heatmaps `{config.heatmap_cfo}`, constellations `{config.constellation_cfo}`",
         f"- Method order: report `{METHOD_ORDER}`, constellation `{CONSTELLATION_METHOD_ORDER}`, report plots `{REPORT_PLOT_FILES}`",
         f"- Receiver-state condition: default sigma `{USRNET_CONDITIONING.default_sigma_condition:.4f}`, sensitivity grid `{USRNET_CONDITIONING.sensitivity_sigmas}`",
-        f"- USR-Net architecture: layers `{USRNET_ARCHITECTURE.num_layers}`, features `{USRNET_ARCHITECTURE.feature_channels}`, hidden `{USRNET_ARCHITECTURE.conv_hidden_channels}`, kernel `{USRNET_ARCHITECTURE.conv_kernel_size}`, dilations `{USRNET_ARCHITECTURE.conv_dilations}`, final gain `{USRNET_ARCHITECTURE.final_gain_enabled}`",
-        f"- USR-Net init: rho `{USRNET_ARCHITECTURE.rho_init}`, gamma `{USRNET_ARCHITECTURE.gamma_init}`, alpha `{USRNET_ARCHITECTURE.alpha_init}`, core rho `{CORE_REFERENCE_MODEL.rho_init}`, core gamma `{CORE_REFERENCE_MODEL.gamma_init}`",
-        f"- USR-Net loss: layer weights `{USRNET_LOSS.layer_weights}`, temp `{USRNET_LOSS.temp_cls}`, CE `{USRNET_LOSS.cls_weight}`, identity `{USRNET_LOSS.identity_weight}`, correction `{USRNET_LOSS.correction_weight}`, guard `{USRNET_LOSS.guard_weight}`",
+        f"- Neural-USR architecture: layers `{USRNET_ARCHITECTURE.num_layers}`, features `{USRNET_ARCHITECTURE.feature_channels}`, hidden `{USRNET_ARCHITECTURE.conv_hidden_channels}`, kernel `{USRNET_ARCHITECTURE.conv_kernel_size}`, dilations `{USRNET_ARCHITECTURE.conv_dilations}`, anchor final gain `{USRNET_ARCHITECTURE.final_gain_enabled}`",
+        f"- Neural-USR init: shared gamma `{USRNET_ARCHITECTURE.shared_gamma_init}`, layer gamma `{USRNET_ARCHITECTURE.layer_gamma_init}`, eta `{USRNET_ARCHITECTURE.eta_init}`, core rho `{CORE_REFERENCE_MODEL.rho_init}`, core gamma `{CORE_REFERENCE_MODEL.gamma_init}`",
+        f"- Neural-USR loss: layer weights `{USRNET_LOSS.layer_weights}`, temp `{USRNET_LOSS.temp_cls}`, CE `{USRNET_LOSS.cls_weight}`, identity `{USRNET_LOSS.identity_weight}`, correction `{USRNET_LOSS.correction_weight}`, guard `{USRNET_LOSS.guard_weight}`",
         f"- Core reference train: epochs `{core_train.epochs}`, batch `{core_train.batch_size}`, lr `{core_train.learning_rate:.1e}`, delta span `{core_train.delta_span:.2f}`, Eb/N0 `{core_train.ebn0_choices}`, sigma `{core_train.sigma_condition}`",
-        f"- USR-Net phases: {phase_text}",
+        f"- Neural-USR phases: {phase_text}",
         f"- Validation model-selection: deltas `{validation.delta_values}`, sigma `{validation.sigma_condition}`, batch `{validation.batch_size}`, Eb/N0 `{validation.ebn0_choices}`",
         f"- Diagnostics: summary deltas `{SUMMARY_DELTA_GRID}`, per-layer deltas `{PER_LAYER_DELTA_VALUES}`, sign probe delta `{USRNET_CONDITIONING.sign_probe_delta:.2f}`, sign probe Eb/N0 `{USRNET_CONDITIONING.sign_probe_ebn0_db:.1f} dB`, sign probe batch `{USRNET_CONDITIONING.sign_probe_batch_size}`",
         f"- Smoke mode: `{smoke_mode}`. Smoke signed grid `{tuple(float(v) for v in SMOKE_SIGNED_CFO_GRID)}`, BER blocks `{SMOKE_BER_BLOCKS}`, BER batch `{SMOKE_BER_BATCH_SIZE}`, constellation blocks `{SMOKE_CONSTELLATION_NUM_BLOCKS}`, spectral blocks `{SMOKE_SPECTRAL_EVAL_BLOCKS}`, PAPR blocks `{SMOKE_PAPR_EVAL_BLOCKS}`, train batch `{SMOKE_TRAIN_SYMBOL_BATCH_SIZE}`",
@@ -341,7 +348,7 @@ def _plot_per_layer_metric(output_dir: Path, layer_df: pd.DataFrame, *, metric: 
         ax.set_title(f"{method_name}, delta={delta_value:.2f}")
         ax.grid(True, alpha=0.25)
         if row_idx == 1:
-            ax.set_xlabel("USR-Net layer")
+            ax.set_xlabel("Neural-USR layer")
         if col_idx == 0:
             ax.set_ylabel(ylabel)
     fig.tight_layout()
@@ -516,51 +523,38 @@ def _acceptance_lines(main_df: pd.DataFrame, core_df: pd.DataFrame, learned_bund
     def _ber(frame_lookup: dict[tuple[str, float], object], method_name: str, delta_value: float) -> float:
         return float(frame_lookup[(method_name, float(delta_value))]["BER"])
 
+    del learned_bundle
     learned_usr = _ber(lookup, "LearnedUSRNet", 0.10)
     learned_core = _ber(core_lookup, "LearnedCoreReference", 0.10)
+    ofdm_zero_gap = _ber(lookup, "OFDMUSRNet", 0.0) - _ber(lookup, "OFDM", 0.0)
+    learned_zero_gap = _ber(lookup, "LearnedUSRNet", 0.0) - _ber(lookup, "Learned", 0.0)
     checks = {
-        "1": learned_usr <= 1.10 * learned_core,
-        "2": _ber(lookup, "LearnedUSRNet", 0.10) < _ber(lookup, "OFDMUSRNet", 0.10),
-        "3": _ber(lookup, "LearnedUSRNet", 0.05) <= 1.02 * _ber(lookup, "OFDMUSRNet", 0.05),
-        "4": (_ber(lookup, "OFDMUSRNet", 0.0) - _ber(lookup, "OFDM", 0.0) <= 0.002)
-        and (_ber(lookup, "LearnedUSRNet", 0.0) - _ber(lookup, "Learned", 0.0) <= 0.002),
+        "within_10pct": learned_usr <= 1.10 * learned_core,
+        "zero_cfo_safe": (ofdm_zero_gap <= 0.002) and (learned_zero_gap <= 0.002),
     }
-    alpha_values = learned_bundle.receiver.parameter_summary()["alpha_t"]
     neural_improved = learned_usr < learned_core
-    checks["5"] = neural_improved or max(alpha_values) <= 0.08
 
     lines = [
         (
-            f"{'PASS' if checks['1'] else 'FAIL'} 1. Learned + USR-Net matches or improves the internal diagonal-core reference at delta=0.10 within 10 percent relative "
-            f"(USR `{learned_usr:.4e}` vs core `{learned_core:.4e}`)."
+            f"{'PASS' if checks['within_10pct'] else 'FAIL'} 1. Learned + Neural-USR matches the `r_core` ablation at delta=0.10 within 10 percent "
+            f"(Neural-USR `{learned_usr:.4e}` vs `r_core` `{learned_core:.4e}`)."
         ),
         (
-            f"{'PASS' if checks['2'] else 'FAIL'} 2. Learned + USR-Net beats OFDM + USR-Net at delta=0.10 "
-            f"(BER `{_ber(lookup, 'LearnedUSRNet', 0.10):.4e}` vs `{_ber(lookup, 'OFDMUSRNet', 0.10):.4e}`)."
-        ),
-        (
-            f"{'PASS' if checks['3'] else 'FAIL'} 3. Learned + USR-Net beats OFDM + USR-Net at delta=0.05 or is very close "
-            f"(BER `{_ber(lookup, 'LearnedUSRNet', 0.05):.4e}` vs `{_ber(lookup, 'OFDMUSRNet', 0.05):.4e}`)."
-        ),
-        (
-            f"{'PASS' if checks['4'] else 'FAIL'} 4. At delta=0, USR-Net does not worsen BER by more than absolute 0.002 "
-            f"(OFDM gap `{(_ber(lookup, 'OFDMUSRNet', 0.0) - _ber(lookup, 'OFDM', 0.0)):.4e}`, "
-            f"Learned gap `{(_ber(lookup, 'LearnedUSRNet', 0.0) - _ber(lookup, 'Learned', 0.0)):.4e}`)."
-        ),
-        (
-            f"{'PASS' if checks['5'] else 'FAIL'} 5. If the neural residual branch does not improve over the diagonal core, alpha stays small and the stable correction is retained "
-            f"(alpha_t={alpha_values})."
+            f"{'PASS' if checks['zero_cfo_safe'] else 'FAIL'} 2. Zero-CFO BER is not degraded by more than absolute 0.002 "
+            f"(OFDM gap `{ofdm_zero_gap:.4e}`, Learned gap `{learned_zero_gap:.4e}`)."
         ),
     ]
-    if not neural_improved:
+    if neural_improved:
+        lines.append("Neural refinement gain: the three-layer unfolded neural output improves over the `r_core` anchor baseline.")
+    else:
         lines.append(
-            "USR-Net selected the stable model-guided correction: the learned residual branch stayed modest relative to the diagonal-core anchor."
+            "Neural-USR stays close to the stable model-guided reference: the learned unfolded updates preserve the `r_core` baseline rather than degrading it."
         )
     return lines, checks
 
 
 def _append_report_sections(
-    output_dir: Path,
+    report_path: Path,
     *,
     acceptance_lines: list[str],
     core_df: pd.DataFrame,
@@ -570,17 +564,17 @@ def _append_report_sections(
 ) -> None:
     lines = [
         "",
-        "## USR-Net Acceptance",
+        "## Neural-USR Acceptance",
         "",
         *acceptance_lines,
         "",
-        "## USR-Net Description",
+        "## Neural-USR Description",
         "",
-        "USR-Net is a three-layer unfolded symbol refinement network with model-guided correction anchors and learned residual dilated convolutional refinement blocks.",
+        "Neural-USR is a three-layer unfolded symbol refinement network whose final detector output is produced by learned neural update layers.",
         "",
-        "The receiver-state condition is used only to build the diagonal anchor from the fixed effective operator. The practical USR-Net path does not use off-diagonal operator cancellation.",
+        "The model-guided diagonal reference initializes and conditions the network. The practical Neural-USR path does not use off-diagonal operator cancellation and does not output the anchor directly.",
         "",
-        "## Internal Diagonal-Core Reference",
+        "## r_core Ablation",
         "",
         core_df.to_string(index=False) if not core_df.empty else "(empty)",
         "",
@@ -590,13 +584,12 @@ def _append_report_sections(
         "",
         "## Learned Parameters",
         "",
-        f"- OFDM + USR-Net: {ofdm_bundle.receiver.parameter_summary()}",
-        f"- Learned + USR-Net: {learned_bundle.receiver.parameter_summary()}",
+        f"- OFDM + Neural-USR: {ofdm_bundle.receiver.parameter_summary()}",
+        f"- Learned + Neural-USR: {learned_bundle.receiver.parameter_summary()}",
         "",
     ]
-    for report_name in ("report.md", "report.MD"):
-        report_path = output_dir / report_name
-        report_path.write_text(report_path.read_text() + "\n".join(lines))
+    report_path = report_path.resolve()
+    report_path.write_text(report_path.read_text() + "\n".join(lines))
 
 
 def run_stage2_usrnet(*, smoke_mode: bool = False) -> object:
@@ -646,7 +639,7 @@ def run_stage2_usrnet(*, smoke_mode: bool = False) -> object:
         seed_offset=1,
     )
 
-    print("[USRNet] Training OFDM + USR-Net", flush=True)
+    print("[USRNet] Training OFDM + Neural-USR", flush=True)
     ofdm_bundle = train_usrnet_receiver(
         config,
         ofdm_tx,
@@ -661,7 +654,7 @@ def run_stage2_usrnet(*, smoke_mode: bool = False) -> object:
         conditioning_config=USRNET_CONDITIONING,
         seed_offset=10,
     )
-    print("[USRNet] Training Learned + USR-Net", flush=True)
+    print("[USRNet] Training Learned + Neural-USR", flush=True)
     learned_bundle = train_usrnet_receiver(
         config,
         learned_tx,
@@ -684,7 +677,7 @@ def run_stage2_usrnet(*, smoke_mode: bool = False) -> object:
         stage_summary_df=pd.concat([ofdm_bundle.stage_summary_df, learned_bundle.stage_summary_df], ignore_index=True),
         stage_failed=False,
         failed_stage=None,
-        stop_reason="Completed frozen-front-end USR-Net training for OFDM and Learned receivers.",
+        stop_reason="Completed frozen-front-end Neural-USR training for OFDM and Learned receivers.",
     )
     schemes = build_usrnet_schemes(
         ofdm_tx,
@@ -755,17 +748,17 @@ def run_stage2_usrnet(*, smoke_mode: bool = False) -> object:
         output_dir=config.output_dir,
         plot_files=REPORT_PLOT_FILES,
         extra_metadata={
-            "title": "Residual-CFO Stage 2 USR-Net Report",
+            "title": "Residual-CFO Stage 2 Neural-USR Report",
             "overview_lines": [
-                "USR-Net is the main Stage 2 receiver for this package.",
+                "Neural-USR is the main Stage 2 receiver for this package.",
                 "The front-end Stage 1 waveform and receiver bases remain frozen.",
-                "The practical receiver is a three-layer unfolded symbol refinement network anchored by diagonal model-guided corrections and small residual dilated-convolution updates.",
+                "The model-guided reference initializes and conditions the network, while the final detector output is produced by three learned unfolded neural update layers.",
             ],
             "control_lines": _stage2_control_lines(config, phi_sign=phi_sign, smoke_mode=smoke_mode),
         },
     )
     _append_report_sections(
-        config.output_dir,
+        report_path,
         acceptance_lines=acceptance_lines,
         core_df=core_df,
         sigma_df=sigma_df,

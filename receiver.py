@@ -75,9 +75,9 @@ class USRNetArchitectureConfig:
     conv_kernel_size: int = 3
     conv_dilations: tuple[int, ...] = (1, 2, 4)
     final_gain_enabled: bool = True
-    rho_init: tuple[float, ...] = (0.85, 0.90, 0.95)
-    gamma_init: tuple[float, ...] = (1.0, 1.0, 1.0)
-    alpha_init: tuple[float, ...] = (0.03, 0.05, 0.05)
+    shared_gamma_init: float = 1.0
+    layer_gamma_init: tuple[float, ...] = (1.0, 1.0, 1.0)
+    eta_init: tuple[float, ...] = (0.125, 0.125, 0.125)
 
     def __post_init__(self) -> None:
         if self.num_layers < 1:
@@ -88,12 +88,10 @@ class USRNetArchitectureConfig:
             raise ValueError("conv_kernel_size must be a positive odd integer.")
         if len(self.conv_dilations) != 3:
             raise ValueError("USR-Net currently expects exactly three dilated Conv1d layers.")
-        if len(self.rho_init) != self.num_layers:
-            raise ValueError("rho_init must match num_layers.")
-        if len(self.gamma_init) != self.num_layers:
-            raise ValueError("gamma_init must match num_layers.")
-        if len(self.alpha_init) != self.num_layers:
-            raise ValueError("alpha_init must match num_layers.")
+        if len(self.layer_gamma_init) != self.num_layers:
+            raise ValueError("layer_gamma_init must match num_layers.")
+        if len(self.eta_init) != self.num_layers:
+            raise ValueError("eta_init must match num_layers.")
 
 
 @dataclass(frozen=True)
@@ -125,8 +123,10 @@ class USRNetPhaseConfig:
     delta_span: float
     ebn0_choices: tuple[float, ...]
     disable_neural: bool
+    train_anchor: bool
+    train_layer_reference: bool
     train_conv: bool
-    train_alpha: bool
+    train_eta: bool
 
 
 @dataclass(frozen=True)
@@ -2344,6 +2344,11 @@ def _raw_rho_from_target(target: float) -> float:
     return _inverse_sigmoid(normalized)
 
 
+def _raw_eta_from_target(target: float) -> float:
+    normalized = (float(target) - 0.05) / 0.15
+    return _inverse_sigmoid(normalized)
+
+
 def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
     return numerator / (denominator + 1.0e-6)
 
@@ -2526,17 +2531,17 @@ class UnfoldedSymbolRefiner(nn.Module):
         self.num_layers = int(architecture_config.num_layers)
         self.eval_condition_sigma = float(eval_condition_sigma)
         self.final_gain_enabled = bool(architecture_config.final_gain_enabled)
-        self.raw_rho_t = nn.Parameter(
-            torch.tensor([_raw_rho_from_target(value) for value in architecture_config.rho_init], dtype=torch.float32)
+        self.raw_shared_gamma = nn.Parameter(
+            torch.tensor(_inverse_softplus(architecture_config.shared_gamma_init), dtype=torch.float32)
         )
         self.raw_gamma_t = nn.Parameter(
-            torch.tensor([_inverse_softplus(value) for value in architecture_config.gamma_init], dtype=torch.float32)
+            torch.tensor([_inverse_softplus(value) for value in architecture_config.layer_gamma_init], dtype=torch.float32)
         )
-        self.raw_alpha_t = nn.Parameter(
+        self.raw_eta_t = nn.Parameter(
             torch.tensor(
                 [
-                    _inverse_sigmoid(min(max(value / 0.2, 1.0e-4), 1.0 - 1.0e-4))
-                    for value in architecture_config.alpha_init
+                    _raw_eta_from_target(min(max(value, 0.0501), 0.1999))
+                    for value in architecture_config.eta_init
                 ],
                 dtype=torch.float32,
             )
@@ -2555,9 +2560,9 @@ class UnfoldedSymbolRefiner(nn.Module):
 
     def parameter_summary(self) -> dict[str, object]:
         return {
-            "rho_t": [float(value) for value in (0.1 + 0.9 * torch.sigmoid(self.raw_rho_t)).detach().cpu().tolist()],
-            "gamma_t": [float(value) for value in F.softplus(self.raw_gamma_t).detach().cpu().tolist()],
-            "alpha_t": [float(value) for value in (0.2 * torch.sigmoid(self.raw_alpha_t)).detach().cpu().tolist()],
+            "shared_gamma": float(F.softplus(self.raw_shared_gamma).item()),
+            "layer_gamma_t": [float(value) for value in F.softplus(self.raw_gamma_t).detach().cpu().tolist()],
+            "eta_t": [float(value) for value in (0.05 + 0.15 * torch.sigmoid(self.raw_eta_t)).detach().cpu().tolist()],
             "final_gain_re": float(self.final_gain_re.item()),
             "final_gain_im": float(self.final_gain_im.item()),
         }
@@ -2588,6 +2593,11 @@ class UnfoldedSymbolRefiner(nn.Module):
         ]
         return torch.stack(feature_list, dim=1).to(torch.float32)
 
+    def _shared_anchor(self, z0: torch.Tensor, d_hat: torch.Tensor) -> torch.Tensor:
+        shared_gamma = F.softplus(self.raw_shared_gamma)
+        denom = 1.0 + shared_gamma * (d_hat - 1.0)
+        return self._gain() * _safe_divide(z0, denom)
+
     def forward_refine(
         self,
         z0: torch.Tensor,
@@ -2598,13 +2608,13 @@ class UnfoldedSymbolRefiner(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, object]] | torch.Tensor:
         A_hat = build_a_hat(self.W_tx, self.V, delta_condition, phi_sign=self.phi_sign)
         d_hat = torch.diagonal(A_hat, dim1=-2, dim2=-1)
-        rho_t = 0.1 + 0.9 * torch.sigmoid(self.raw_rho_t)
         gamma_t = F.softplus(self.raw_gamma_t)
-        alpha_t = 0.2 * torch.sigmoid(self.raw_alpha_t)
+        eta_t = 0.05 + 0.15 * torch.sigmoid(self.raw_eta_t)
         if disable_neural:
-            alpha_t = torch.zeros_like(alpha_t)
+            eta_t = torch.zeros_like(eta_t)
 
-        s_hat = z0
+        shared_anchor = self._shared_anchor(z0, d_hat)
+        s_hat = shared_anchor
         iterates: list[torch.Tensor] = []
         anchors: list[torch.Tensor] = []
         residuals: list[torch.Tensor] = []
@@ -2616,11 +2626,9 @@ class UnfoldedSymbolRefiner(nn.Module):
             delta_tensor = self.blocks[layer_idx](features)
             delta_complex = torch.complex(delta_tensor[:, 0, :], delta_tensor[:, 1, :]).to(torch.complex64)
             residuals.append(delta_complex)
-            s_hat = (1.0 - rho_t[layer_idx]) * s_hat + rho_t[layer_idx] * (r_t + alpha_t[layer_idx] * delta_complex)
+            s_hat = s_hat + eta_t[layer_idx].to(s_hat.dtype) * delta_complex
             iterates.append(s_hat)
 
-        corrected = self._gain() * s_hat
-        iterates[-1] = corrected
         aux = {
             "A_hat": A_hat,
             "diag": d_hat,
@@ -2628,12 +2636,12 @@ class UnfoldedSymbolRefiner(nn.Module):
             "anchors": anchors,
             "residuals": residuals,
             "eps_hat": delta_condition,
-            "r_core": anchors[0],
-            "rho_t": [float(value) for value in rho_t.detach().cpu().tolist()],
-            "gamma_t": [float(value) for value in gamma_t.detach().cpu().tolist()],
-            "alpha_t": [float(value) for value in alpha_t.detach().cpu().tolist()],
+            "r_core": shared_anchor,
+            "shared_anchor": shared_anchor,
+            "layer_gamma_t": [float(value) for value in gamma_t.detach().cpu().tolist()],
+            "eta_t": [float(value) for value in eta_t.detach().cpu().tolist()],
         }
-        return (corrected, aux) if return_aux else corrected
+        return (s_hat, aux) if return_aux else s_hat
 
     def forward(
         self,
@@ -2722,6 +2730,7 @@ def _evaluate_validation_grid(
     *,
     validation_config: USRNetValidationConfig,
     seed: int,
+    core_reference: DiagonalCoreReference | None = None,
 ) -> dict[str, float]:
     set_seed(seed)
     ber_rows: list[float] = []
@@ -2746,8 +2755,10 @@ def _evaluate_validation_grid(
 
         with torch.no_grad():
             if isinstance(receiver, UnfoldedSymbolRefiner):
-                corrected, aux = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
-                r_core = aux["r_core"]
+                corrected, _ = receiver.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
+                if core_reference is None:
+                    raise ValueError("USR-Net validation requires an explicit diagonal core reference.")
+                r_core, _ = core_reference.forward_refine(batch["z0"], batch["delta_condition"], return_aux=True)
                 net_mse = _normalized_batch_mse(corrected, batch["true_symbols"])
                 core_mse = _normalized_batch_mse(r_core, batch["true_symbols"])
                 guard_loss = torch.relu(net_mse - core_mse) ** 2
@@ -2841,7 +2852,6 @@ def _usrnet_loss(
         + float(loss_config.correction_weight) * L_corr
         + float(loss_config.guard_weight) * L_guard
     )
-    alpha_values = receiver.parameter_summary()["alpha_t"]
     metrics = {
         "train_total": float(loss.item()),
         "train_Lmse": float(L_sym.item()),
@@ -2851,7 +2861,7 @@ def _usrnet_loss(
         "guard_loss": float(L_guard.item()),
         "core_mse": float(core_mse.item()),
         "net_mse": float(net_mse.item()),
-        "residual_scale": float(np.mean(alpha_values)),
+        "residual_scale": float(np.mean(receiver.parameter_summary()["eta_t"])),
     }
     return loss, metrics
 
@@ -2985,8 +2995,8 @@ def train_usrnet_receiver(
     ).to(config.device)
     core_params = core_reference.parameter_summary()
     with torch.no_grad():
+        receiver.raw_shared_gamma.fill_(_inverse_softplus(float(core_params["gamma"])))
         receiver.raw_gamma_t.fill_(_inverse_softplus(float(core_params["gamma"])))
-        receiver.raw_rho_t.fill_(_raw_rho_from_target(float(core_params["rho"])))
         receiver.final_gain_re.fill_(float(core_params["final_gain_re"]))
         receiver.final_gain_im.fill_(float(core_params["final_gain_im"]))
 
@@ -3000,8 +3010,10 @@ def train_usrnet_receiver(
                 delta_span=0.15,
                 ebn0_choices=DEFAULT_EBN0_CHOICES,
                 disable_neural=True,
+                train_anchor=True,
+                train_layer_reference=False,
                 train_conv=False,
-                train_alpha=False,
+                train_eta=False,
             ),
             USRNetPhaseConfig(
                 name="Phase1NeuralUnfreeze",
@@ -3011,8 +3023,10 @@ def train_usrnet_receiver(
                 delta_span=0.15,
                 ebn0_choices=DEFAULT_EBN0_CHOICES,
                 disable_neural=False,
+                train_anchor=False,
+                train_layer_reference=False,
                 train_conv=True,
-                train_alpha=True,
+                train_eta=True,
             ),
             USRNetPhaseConfig(
                 name="Phase2Robustness",
@@ -3022,8 +3036,10 @@ def train_usrnet_receiver(
                 delta_span=0.15,
                 ebn0_choices=DEFAULT_EBN0_CHOICES,
                 disable_neural=False,
+                train_anchor=True,
+                train_layer_reference=True,
                 train_conv=True,
-                train_alpha=True,
+                train_eta=True,
             ),
         )
 
@@ -3034,11 +3050,11 @@ def train_usrnet_receiver(
     for phase_idx, phase in enumerate(phase_configs):
         for parameter in receiver.blocks.parameters():
             parameter.requires_grad = bool(phase.train_conv)
-        receiver.raw_alpha_t.requires_grad = bool(phase.train_alpha)
-        receiver.raw_gamma_t.requires_grad = True
-        receiver.raw_rho_t.requires_grad = True
-        receiver.final_gain_re.requires_grad = True
-        receiver.final_gain_im.requires_grad = True
+        receiver.raw_eta_t.requires_grad = bool(phase.train_eta)
+        receiver.raw_gamma_t.requires_grad = bool(phase.train_layer_reference)
+        receiver.raw_shared_gamma.requires_grad = bool(phase.train_anchor)
+        receiver.final_gain_re.requires_grad = bool(phase.train_anchor)
+        receiver.final_gain_im.requires_grad = bool(phase.train_anchor)
 
         optimizer = torch.optim.Adam(
             [parameter for parameter in receiver.parameters() if parameter.requires_grad],
@@ -3077,6 +3093,7 @@ def train_usrnet_receiver(
                 receiver,
                 validation_config=validation_config,
                 seed=config.base_seed + 40_000 + 1_000 * phase_idx + epoch_idx,
+                core_reference=core_reference,
             )
             params = receiver.parameter_summary()
             history_rows.append(
@@ -3093,9 +3110,9 @@ def train_usrnet_receiver(
                     "val_ber": val_metrics["val_ber"],
                     "residual_scale": metrics["residual_scale"],
                     "phase": phase.name,
-                    "rho_t": repr(params["rho_t"]),
-                    "gamma_t": repr(params["gamma_t"]),
-                    "alpha_t": repr(params["alpha_t"]),
+                    "shared_gamma": params["shared_gamma"],
+                    "layer_gamma_t": repr(params["layer_gamma_t"]),
+                    "eta_t": repr(params["eta_t"]),
                 }
             )
             if val_metrics["val_total"] < best_val_total:
@@ -3110,9 +3127,9 @@ def train_usrnet_receiver(
                     "hard_cfo_weighted_ber": val_metrics["hard_cfo_weighted_ber"],
                     "guard_loss": val_metrics["guard_loss"],
                     "elapsed_seconds": float(perf_counter() - phase_start),
-                    "rho_t": repr(params["rho_t"]),
-                    "gamma_t": repr(params["gamma_t"]),
-                    "alpha_t": repr(params["alpha_t"]),
+                    "shared_gamma": params["shared_gamma"],
+                    "layer_gamma_t": repr(params["layer_gamma_t"]),
+                    "eta_t": repr(params["eta_t"]),
                     "final_gain_re": params["final_gain_re"],
                     "final_gain_im": params["final_gain_im"],
                 }
