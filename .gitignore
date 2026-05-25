@@ -6,7 +6,9 @@ stage2_oracle_diagnostics/
 smoke_stage2_outputs/
 stage2_blind_outputs/
 stage1_papr_sidecar_outputs/
+stage2_usrnet_outputs/
 side/oracle_diagnostics/
+stage2_grrnet_outputs/
 
 # Ignore DS_store folder and macOS DS_Store files
 DS_store/
@@ -14,3 +16,7 @@ DS_store/
 
 # Ignore Python cache directories
 __pycache__/
+
+# Local files for tracking and planning
+AGENTS.md
+.codex/
